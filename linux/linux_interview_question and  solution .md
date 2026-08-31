@@ -3712,5 +3712,6421 @@ PRINT WITH METADATA:
 
 > **JPMorgan interview tip:** Finance firms care about audit trails and compliance — they'll appreciate if you mention saving findings to a file before any cleanup action, and suggest scheduling this as a cron job for ongoing monitoring (`0 6 * * * find /var -type f -name "*.log" | wc -l >> /var/log/log_inventory.csv`). Proactive monitoring over reactive firefighting is the mindset they want to see.
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Manage Service Failure Recovery
+Company: Apple | Difficulty: Hard
+Scenario
+You have a shell script at /usr/local/bin/check_[app.sh](http://app.sh) that runs periodically and exits with a non-zero code. The script is currently failing due to a simulated error condition.
+Task
+Create a systemd service named check_app.service that automatically restarts the script when it fails, but stops retrying after 3 restart attempts within 60 seconds. Configure the service to start on boot with a 5-second delay between restart attempts, then start the service and verify it hits the restart limit.
+
+## Manage Service Failure Recovery — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply (The Story)
+
+### What Problem Are We Solving?
+
+```
+Without restart logic:
+  check_app.sh crashes at 03:00 AM
+          ↓
+  Service stays dead until someone manually restarts it
+          ↓
+  App is down for hours — users affected
+
+With systemd restart logic:
+  check_app.sh crashes at 03:00 AM
+          ↓
+  systemd detects exit code ≠ 0
+          ↓
+  Waits 5 seconds → restarts automatically
+  Crash again → wait 5s → restart
+  Crash again → wait 5s → restart
+          ↓
+  After 3 attempts in 60 seconds → GIVES UP
+  (prevents infinite crash loop hammering the system)
+          ↓
+  Sends alert → on-call engineer wakes up
+```
+
+### The Three systemd Restart Controls
+
+```
+RestartSec=5          →  wait 5 seconds between each restart attempt
+                          prevents rapid crash loops
+
+StartLimitBurst=3     →  allow max 3 start attempts...
+StartLimitIntervalSec=60 →  ...within any 60-second window
+
+When limit hit: service enters "failed" state, stops retrying
+```
+
+### Visual Timeline
+
+```
+t=0s    Service starts → crashes (exit code 1)
+t=5s    Restart #1    → crashes (exit code 1)
+t=10s   Restart #2    → crashes (exit code 1)
+t=15s   Restart #3    → crashes (exit code 1)
+        ↑
+        3 crashes in 15 seconds < 60 second window
+        → LIMIT HIT → systemd stops → "failed" state
+        No more automatic restarts
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Failing Script### Step 2 — Create the systemd Service Unit File### Step 3 — Reload, Enable, and Validate### Step 4 — Simulate systemd Behavior (Container-Safe)### Step 5 — Show What systemd Commands Look Like in ProductionEverything working exactly as designed. Now let's understand every piece deeply.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### The Full systemd Unit File Structure
+
+```ini
+[Unit]          ← METADATA: what is this service, dependencies, limits
+[Service]       ← BEHAVIOUR: how to run it, restart policy, environment
+[Install]       ← BOOT: when to start it during system startup
+```
+
+Each section answers a different question:
+
+```
+[Unit]    →  "What is this and when should it run?"
+[Service] →  "How exactly should systemd manage this process?"
+[Install] →  "Should this start on boot, and for which target?"
+```
+
+---
+
+### `Restart=` Options — Full Comparison
+
+```
+Restart=no           → never restart (default)
+                       Use for: one-shot tasks, scripts that run once
+
+Restart=always       → restart on ANY exit — clean or failure
+                       Use for: daemons that must ALWAYS be running
+
+Restart=on-failure   → restart ONLY when exit code ≠ 0 or crash signal
+                       Use for: services that sometimes exit cleanly
+                                (our case — script should restart when broken)
+
+Restart=on-success   → restart ONLY when exit code = 0
+                       Use for: polling loops that restart after success
+
+Restart=on-abnormal  → restart on crash signal, timeout, watchdog — NOT clean exit
+                       Use for: strict services where manual stop = intentional
+
+Restart=on-abort     → only on unhandled signals (SIGABRT, SIGSEGV)
+                       Use for: C applications that shouldn't normally crash
+```
+
+---
+
+### `StartLimitBurst` and `StartLimitIntervalSec` — The Rate Limiter
+
+```
+StartLimitBurst=3          ←  maximum 3 start attempts
+StartLimitIntervalSec=60s  ←  within any 60-second sliding window
+
+     Timeline:
+     ┌──────────────── 60 second window ─────────────────┐
+     start #1   start #2   start #3
+     t=0s       t=5s       t=10s
+       ↓          ↓          ↓
+     CRASH      CRASH      CRASH
+                            ↑
+                     3 crashes in 10s < 60s
+                     → LIMIT HIT → FAILED state
+     └────────────────────────────────────────────────────┘
+
+What if crashes are spread out?
+     t=0s    CRASH  (attempt 1)
+     t=5s    CRASH  (attempt 2)
+     ...
+     t=65s   CRASH  (attempt 3 — but window reset at 60s!)
+     → Only 2 in last 60s → still under limit → keeps trying
+```
+
+---
+
+### `Type=` — How systemd Tracks the Process
+
+```
+Type=simple    → PID from ExecStart IS the service
+                 systemd watches it directly
+                 Most common for scripts and simple daemons
+
+Type=forking   → ExecStart forks a child and exits
+                 systemd tracks the child (needs PIDFile=)
+                 Old-style daemons (Apache 2.2, older MySQL)
+
+Type=notify    → Process signals systemd when READY
+                 sd_notify() call from the application
+                 More reliable "ready" detection
+
+Type=oneshot   → Runs once and exits (like a script)
+                 systemd waits for it to finish
+                 RemainAfterExit=yes to show "active" after
+
+Type=exec      → Like simple but waits for exec() to succeed
+                 Better for wrapper scripts
+
+For our script: Type=simple is correct ✓
+  The script IS the service — systemd watches its PID directly
+```
+
+---
+
+### `WantedBy=multi-user.target` — What Does Enable Actually Do?
+
+```
+systemctl enable check_app.service
+
+What it does physically:
+  Creates a SYMLINK:
+  /etc/systemd/system/multi-user.target.wants/
+    check_app.service → /etc/systemd/system/check_app.service
+
+Boot sequence:
+  systemd starts → reaches multi-user.target
+  → reads .wants/ directory
+  → finds check_app.service symlink
+  → starts it automatically
+
+systemctl disable = removes the symlink
+systemctl start  = starts RIGHT NOW (regardless of enable)
+systemctl enable = starts ON NEXT BOOT
+
+enable + start = both immediately AND on every future boot ✓
+```
+
+---
+
+### `systemctl reset-failed` — Why You Need It
+
+```
+After hitting StartLimitBurst:
+  Service state = "failed" (start-limit-hit)
+  systemd REFUSES to start it again automatically
+
+This is intentional — prevents infinite crash hammering
+
+To restart after fixing the underlying problem:
+  1. Fix the script (remove the bug)
+  2. sudo systemctl reset-failed check_app.service
+     → clears the failed state, resets the counter
+  3. sudo systemctl start check_app.service
+     → starts fresh with full 3 retries available again
+
+Skipping reset-failed → systemctl start still works
+BUT the counter isn't reset → may hit limit faster
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "Explain the three restart-related directives in this service file."
+
+**Answer:**
+> *"Three separate controls work together. `Restart=on-failure` tells systemd to attempt restart when the process exits with non-zero code or crashes — not on a clean exit. `RestartSec=5s` introduces a 5-second cooling-off delay between each attempt, preventing a tight crash loop that would hammer the system or fill logs. `StartLimitBurst=3` combined with `StartLimitIntervalSec=60s` is the circuit breaker — after 3 start attempts within any 60-second window, systemd stops retrying entirely and marks the service as `failed`. This is the critical safety mechanism that prevents runaway restart loops at 3 AM."*
+
+---
+
+### Q2. "What's the difference between `systemctl enable` and `systemctl start`?"
+
+**Answer:**
+> *"`start` starts the service immediately right now, once. `enable` creates a symlink in the appropriate `.wants/` directory so the service starts automatically on every boot — it doesn't start the service right now. For production deployments you almost always want both: `enable` to survive reboots, `start` to begin immediately without waiting for the next boot. `disable` removes the symlink (stops auto-start on boot) but doesn't stop a currently running service — for that you'd use `stop`."*
+
+```bash
+systemctl start check_app    # run NOW only
+systemctl enable check_app   # run on BOOT only
+systemctl enable --now check_app  # run NOW + on every boot ✓
+```
+
+---
+
+### Q3. "What does `Type=simple` mean and when would you use `Type=forking`?"
+
+**Answer:**
+> *"`Type=simple` means the process launched by `ExecStart` is the main service process — systemd watches that PID directly. When it exits, systemd knows the service ended. `Type=forking` is for old-style Unix daemons that fork a child process and then the parent exits — the service is actually the child. systemd needs a `PIDFile=` to track which PID to watch. In modern infrastructure, `Type=simple` is almost always correct for new services. `Type=notify` is even better for complex services that need to signal systemd when they're truly ready to serve traffic — nginx and PostgreSQL use this."*
+
+---
+
+### Q4. "What happens when `StartLimitBurst` is hit? How do you recover?"
+
+**Answer:**
+> *"When the limit is hit, systemd marks the service as `failed` with result `start-limit-hit` and stops all automatic restart attempts. The service stays dead even if `Restart=always` is configured — the rate limiter overrides it. To recover you need to: fix the underlying problem in the script or application, then run `systemctl reset-failed check_app.service` to clear the failed state and reset the counter, then `systemctl start check_app.service` to bring it back up. If you skip `reset-failed`, the counter carries over and you might hit the limit faster on the next failure."*
+
+```bash
+sudo systemctl reset-failed check_app.service  # clear failed state
+sudo systemctl start check_app.service         # restart fresh
+sudo journalctl -fu check_app.service          # watch in real time
+```
+
+---
+
+### Q5. "What's `After=network.target` doing in `[Unit]`?"
+
+**Answer:**
+> *"`After=` defines ordering — it tells systemd to wait until `network.target` is reached before starting this service. It doesn't mean the service requires the network — just that if both are being started, the network comes first. For a health check script that connects to a database or makes API calls, starting before the network is ready would cause immediate failures. Common ordering dependencies are `network.target` (basic network up), `network-online.target` (full network connectivity), and `postgresql.service` or `mysql.service` for apps that need a specific database."*
+
+---
+
+### Q6. "How would you watch the service fail and restart in real time?"
+
+**Answer:**
+> *"`journalctl -fu check_app.service` is the go-to command — `-f` follows (like `tail -f`), `-u` filters to the specific unit. You'll see each crash, the restart delay, and eventually the `start-limit-hit` message. For more detail, `systemctl status check_app.service` gives a snapshot with the last few log lines and the current state. During an incident I'd have both open in split terminals — journalctl in one for the live stream, systemctl status in the other for the state machine view."*
+
+```bash
+journalctl -fu check_app.service           # live follow
+journalctl -u check_app.service --since "10 min ago"  # recent history
+systemctl status check_app.service         # current state snapshot
+```
+
+---
+
+### Q7. "How would you add an alert when the service hits the failure limit?"
+
+**Answer:**
+> *"Use `OnFailure=` in the `[Unit]` section to trigger another service when this one fails. The cleanest approach is a dedicated notification service:"*
+
+```ini
+# In check_app.service [Unit] section:
+OnFailure=notify-failure@%n.service
+
+# Create /etc/systemd/system/notify-failure@.service
+[Unit]
+Description=Failure notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/notify.sh %i
+```
+
+```bash
+# /usr/local/bin/notify.sh
+#!/bin/bash
+SERVICE=$1
+echo "ALERT: $SERVICE hit restart limit on $(hostname) at $(date)" \
+  | mail -s "Service Failed: $SERVICE" ops@apple.com
+
+# Or post to Slack/PagerDuty webhook
+curl -X POST https://hooks.slack.com/... \
+  -d "{\"text\": \"$SERVICE failed on $(hostname)\"}"
+```
+
+---
+
+### Q8. "What's the difference between `Restart=on-failure` and `Restart=always`?"
+
+**Answer:**
+> *"`Restart=on-failure` only restarts when the exit code is non-zero or there's a crash signal — a clean `exit 0` stops the restarts. `Restart=always` restarts regardless of exit code — even a clean exit triggers a restart. For our health check script that always fails, both would behave identically. But for a service that sometimes exits cleanly as intended — like a migration script that should run once and stop — `always` would cause an infinite loop of successful runs. For most real services, `on-failure` is the safer default."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+UNIT FILE STRUCTURE:
+  [Unit]    → description, ordering, rate limits
+  [Service] → ExecStart, Restart, Type, Environment
+  [Install] → WantedBy (boot target)
+
+KEY DIRECTIVES:
+  ExecStart=        → command to run
+  Type=simple       → PID from ExecStart is the service
+  Restart=on-failure → restart on non-zero exit / crash
+  RestartSec=5s     → wait 5s between restart attempts
+  StartLimitBurst=3 → max 3 attempts...
+  StartLimitIntervalSec=60s → ...in any 60s window
+  After=network.target → start after networking
+  WantedBy=multi-user.target → enable for normal boot
+
+RESTART= OPTIONS:
+  no          → never restart
+  always      → always restart (even on clean exit)
+  on-failure  → restart on non-zero exit or crash ← most common
+  on-abnormal → only on crash signals/timeout
+
+ESSENTIAL COMMANDS:
+  systemctl daemon-reload          → reload unit files after edits
+  systemd-analyze verify <file>    → validate syntax
+  systemctl enable check_app       → start on boot (adds symlink)
+  systemctl start check_app        → start now
+  systemctl enable --now check_app → both at once ← best practice
+  systemctl status check_app       → current state
+  journalctl -fu check_app         → live log stream
+  systemctl reset-failed check_app → clear failed state to retry
+
+STATES TO KNOW:
+  active (running)      → healthy, running normally
+  failed                → crashed and exceeded restart limit
+  failed (start-limit-hit) → rate limiter triggered ← our case
+  activating (auto-restart) → between restart attempts
+
+RECOVERY WORKFLOW:
+  1. Fix the underlying issue
+  2. systemctl reset-failed check_app
+  3. systemctl start check_app
+  4. journalctl -fu check_app  (watch it recover)
+```
+
+> **Apple interview tip:** They care deeply about **reliability engineering** — mention `OnFailure=` for alerting, `WatchdogSec=` for liveness monitoring, and the distinction between `enable` (persistent) vs `start` (immediate). Showing you think about what happens *after* the limit is hit — the alert, the reset workflow, the root cause investigation — separates a senior SRE answer from a junior "I added Restart=on-failure" answer.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Managing Process Overload
+> **Company:** [Booking.com](http://Booking.com) | **Difficulty:** Medium
+---
+#### Scenario:
+The process count on a production server keeps increasing even though no new workloads were deployed. Zombie processes are accumulating in the system.
+#### Task:
+Find all zombie processes, kill their parent processes to remove the zombies, and confirm they are gone from the system.
+####  Expected Output:
+No leftover or defunct processes should be left after the fix.
+
+## Managing Process Overload — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply (The Story)
+
+### What is a Zombie Process?
+
+```
+Normal process lifecycle:
+  Parent spawns Child
+       ↓
+  Child does work
+       ↓
+  Child finishes → calls exit()
+       ↓
+  Parent calls wait() → reads child's exit code
+       ↓
+  Child entry REMOVED from process table ✓
+
+Zombie process lifecycle:
+  Parent spawns Child
+       ↓
+  Child does work
+       ↓
+  Child finishes → calls exit()
+       ↓
+  Parent NEVER calls wait()  ← THE BUG
+       ↓
+  Child stays in process table as <defunct>
+  Using NO CPU, NO memory — just a PID slot
+       ↓
+  Thousands accumulate → PID table exhausted
+  → "Cannot fork" → new processes can't start
+```
+
+### Why Can't You Kill a Zombie Directly?
+
+```
+kill -9 <zombie_pid>   ←  DOES NOTHING
+
+Reason: the zombie is already DEAD
+        It's just a record waiting to be collected
+        Like a death certificate waiting to be filed
+
+The only fix:
+  Kill or fix the PARENT → parent's cleanup code runs
+  → parent finally calls wait() → zombie disappears
+  OR
+  Parent dies → init/systemd (PID 1) adopts zombie
+  → init calls wait() → zombie cleaned up automatically
+```
+
+### Visual: Process Table
+
+```
+  PID   PPID  STAT  COMMAND
+    1      0   Ss   systemd          ← init, PID 1
+  501      1   S    bash             ← parent (the bug is here)
+  502    501   Z    [worker] <defunct> ← zombie #1 — child of 501
+  503    501   Z    [worker] <defunct> ← zombie #2 — child of 501
+  504    501   Z    [worker] <defunct> ← zombie #3 — child of 501
+
+Fix: kill 501 (the parent bash)
+  → zombies 502, 503, 504 get adopted by systemd
+  → systemd calls wait() → all three disappear ✓
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create Zombie Processes to Simulate the ProblemZombies created. Now the full investigation and cleanup.
+
+### Step 2 — Investigate: Find All Zombies5 zombies confirmed. Now the full investigation workflow.
+
+### Step 3 — Full Investigation: Map Zombies to Their Parents5 zombies with parent 837. Now the complete fix workflow.
+
+### Step 4 — Full Investigation Report and FixZero zombies. System clean. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### The Complete Process Lifecycle
+
+```
+HEALTHY lifecycle:
+  ┌─────────┐   fork()   ┌─────────┐
+  │ PARENT  │ ─────────► │  CHILD  │  ← new PID, new process
+  └─────────┘            └─────────┘
+       │                      │
+       │                      │ does work...
+       │                      │ calls exit(0)
+       │                      ▼
+       │               [ ZOMBIE STATE ] ← stays here waiting
+       │                 exit code = 1
+       │                 "Please collect me"
+       │
+       ├─ waitpid() ─────────────────────────────┐
+       │              Parent reads exit code      │
+       │              Process table entry REMOVED ┘
+       │
+       ▼
+  Parent continues
+```
+
+### What Lives in a Zombie
+
+```
+A zombie process holds:
+  ✓ PID  (occupies a slot in the PID table)
+  ✓ Exit code  (waiting for parent to read it)
+  ✓ Basic accounting info (CPU time used, etc.)
+
+A zombie process has ZERO:
+  ✗ Memory pages
+  ✗ CPU time
+  ✗ File descriptors
+  ✗ Executable code running
+
+This is why kill -9 doesn't work:
+  There's nothing to kill — it's already dead
+  It's a record, not a process
+```
+
+### How `ps` Shows Process States
+
+```
+ps -eo pid,ppid,stat,comm
+
+STAT column meanings:
+  S    ← Sleeping (waiting for event)
+  R    ← Running (on CPU right now)
+  D    ← Uninterruptible sleep (usually disk I/O)
+  T    ← Stopped (SIGSTOP or trace)
+  Z    ← Zombie (defunct) ← what we hunt
+  I    ← Idle kernel thread
+
+Additional flags after main state:
+  <    ← high priority (negative nice)
+  N    ← low priority (positive nice)
+  s    ← session leader
+  l    ← multi-threaded
+  +    ← in foreground process group
+
+So: Sl = Sleeping, multi-threaded (typical daemon)
+    Z  = Zombie (what we're hunting)
+    S  = normal sleeping process (healthy)
+```
+
+### The Fix Logic — Why Killing Parent Works
+
+```
+Before killing parent:
+  PID 873  (parent)  STAT=S  ← alive, has zombie children
+  PID 874  (zombie)  STAT=Z  ← can't kill directly
+  PID 876  (zombie)  STAT=Z
+  PID 877  (zombie)  STAT=Z
+
+After killing parent (SIGTERM → parent dies):
+  PID 873 terminates
+  Kernel runs cleanup:
+    → checks if parent had children
+    → those children (even zombies) get REPARENTED to init (PID 1)
+    → init (systemd) automatically calls wait() on adopted zombies
+    → zombie entries REMOVED from process table ✓
+
+Final state:
+  PID 874  GONE ✓
+  PID 876  GONE ✓
+  PID 877  GONE ✓
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "What is a zombie process? Why can't you kill it with `kill -9`?"
+
+**Answer:**
+> *"A zombie is a process that has finished executing but hasn't been removed from the process table because its parent hasn't called `wait()` to collect its exit status. It holds no memory, runs no code, consumes no CPU — it's just a row in the process table containing the exit code. `kill -9` sends SIGKILL to terminate a running process, but a zombie has no running code to kill — it's already dead. The only fix is to make the parent call `wait()`, either by fixing the parent application or by killing the parent, which triggers kernel reparenting to init, which then calls `wait()` automatically."*
+
+---
+
+### Q2. "How do you find zombie processes on a Linux system?"
+
+**Answer — give all three methods:**
+```bash
+# Method 1 — awk on STAT column (most precise)
+ps -eo pid,ppid,stat,comm | awk '$3=="Z"'
+
+# Method 2 — grep for defunct keyword
+ps aux | grep defunct | grep -v grep
+
+# Method 3 — count only
+ps -eo stat --no-headers | grep -c Z
+
+# Method 4 — pgrep (if available)
+pgrep -l -x 'Z'
+```
+
+---
+
+### Q3. "How do you find which parent is responsible for zombie children?"
+
+**Answer:**
+> *"Every process has a PPID — Parent Process ID. I read it from the `ps` output and trace each zombie back to its parent. The `ps -eo pid,ppid,stat,comm` output gives me all four fields I need. Once I have the PPIDs, I look up those parent processes to understand what application is buggy and failing to call `wait()`."*
+
+```bash
+# Get zombie-to-parent mapping
+ps -eo pid,ppid,stat,comm --no-headers | awk '$3=="Z"' | \
+while read zpid par stat comm; do
+    par_cmd=$(ps -p "$par" -o comm= 2>/dev/null)
+    echo "Zombie $zpid (cmd: $comm) → Parent $par (cmd: $par_cmd)"
+done
+```
+
+---
+
+### Q4. "Why do zombies accumulate? What's the underlying bug in the application?"
+
+**Answer:**
+> *"The root cause is always the same: the parent process calls `fork()` to create children but never calls `wait()` or `waitpid()` to collect their exit status. This is a programming bug — the POSIX standard requires parents to reap their children. Common causes are: a multi-threaded application that forks but the thread handling `wait()` has a race condition, a signal handler that drops `SIGCHLD` events, or an application that forks workers and then crashes before calling `wait()`. The fix at the application level is to add a `SIGCHLD` handler that calls `waitpid(-1, NULL, WNOHANG)` in a loop."*
+
+---
+
+### Q5. "What's the maximum number of processes in the PID table and why do zombies matter?"
+
+**Answer:**
+> *"The PID limit is set by `/proc/sys/kernel/pid_max` — default 32,768 on 32-bit, up to 4 million on 64-bit. Each zombie consumes one PID slot. If zombies accumulate to the point of exhausting the PID table, `fork()` calls start failing with `EAGAIN` — the kernel can't allocate a new PID. This means the system can't spawn any new processes: no new SSH connections, no new commands, nothing. It's a hard system failure despite plenty of free memory and CPU. On Booking.com's scale with high-traffic servers, a buggy deployment that creates one zombie per request could exhaust the PID table within minutes."*
+
+```bash
+cat /proc/sys/kernel/pid_max    # check current limit
+ps aux | wc -l                  # current process count
+```
+
+---
+
+### Q6. "What's the difference between SIGTERM and SIGKILL when dealing with parent processes?"
+
+**Answer:**
+> *"For zombie cleanup, I try SIGTERM first — it gives the parent a chance to shut down gracefully, flush buffers, close connections, and importantly run its cleanup code which may call `wait()` on remaining children. If the parent is properly coded, SIGTERM triggers a clean exit that reaps zombies in the process. SIGKILL is the fallback when the parent is frozen or ignoring signals — the kernel forces termination immediately. Both result in the zombie children being adopted by init and reaped, but SIGTERM is safer for production because it doesn't interrupt in-flight work as abruptly."*
+
+---
+
+### Q7. "How would you prevent zombie accumulation in a production system long-term?"
+
+**Answer — three layers:**
+
+> **Layer 1 — Application fix (root cause):**
+```c
+// In the parent process, add SIGCHLD handler
+signal(SIGCHLD, SIG_IGN);          // simple: ignore child exit → auto-reap
+// OR
+void handler(int sig) {
+    while (waitpid(-1, NULL, WNOHANG) > 0);  // reap all ready children
+}
+signal(SIGCHLD, handler);
+```
+
+> **Layer 2 — Monitoring (detect before crisis):**
+```bash
+# Alert when zombie count exceeds threshold
+ZOMBIES=$(ps -eo stat --no-headers | grep -c Z)
+[ "$ZOMBIES" -gt 10 ] && \
+    echo "ALERT: $ZOMBIES zombies on $(hostname)" | mail ops@booking.com
+```
+
+> **Layer 3 — Systemd containment:**
+```ini
+# /etc/systemd/system/myapp.service
+[Service]
+# systemd kills entire cgroup on stop — no orphaned zombies
+KillMode=control-group
+# Set PID limit — prevents PID exhaustion even if zombies accumulate
+TasksMax=500
+```
+
+---
+
+### Q8. "What's the role of init (PID 1) in zombie cleanup?"
+
+**Answer:**
+> *"Init (PID 1 — systemd on modern Linux) is the ultimate parent of all orphaned processes. When any process dies, the kernel checks if its children are still alive. If yes, those children get reparented to init. Init has a built-in `wait()` loop that constantly reaps any children that finish, including adopted zombies. This is why killing the buggy parent works — even if the parent dies without calling `wait()`, init adopts the zombies and calls `wait()` on them automatically, clearing them from the process table. Init is the system's garbage collector for processes."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+FIND ZOMBIES:
+  ps aux | awk '$8=="Z"'                    # by STAT column
+  ps aux | grep defunct | grep -v grep      # by keyword
+  ps -eo pid,ppid,stat,comm | awk '$3=="Z"' # cleanest — PID+PPID
+  ps -eo stat --no-headers | grep -c Z      # count only
+
+MAP TO PARENTS:
+  ps -eo pid,ppid,stat,comm | awk '$3=="Z" {print $2}' | sort -u
+  # → gives PPID of each zombie's parent
+
+KILL PARENT (the fix):
+  kill -15 <PPID>   # SIGTERM first (graceful)
+  kill -9  <PPID>   # SIGKILL if SIGTERM ignored
+
+VERIFY CLEAN:
+  ps -eo stat --no-headers | grep -c Z   # should be 0
+
+WHAT Z MEANS IN ps STAT:
+  Z = Zombie (defunct) — dead but not reaped
+  < after STAT = high priority
+  s = session leader
+
+WHY kill -9 FAILS ON ZOMBIES:
+  Zombie = already dead, no code running
+  kill sends signal to RUNNING process
+  Nothing to signal → nothing happens
+
+ROOT CAUSE:
+  Parent calls fork() but not wait()
+  Fix in code: signal(SIGCHLD, SIG_IGN)
+               or waitpid(-1, NULL, WNOHANG) in SIGCHLD handler
+
+PID EXHAUSTION CHECK:
+  cat /proc/sys/kernel/pid_max    # max PIDs (~32K default)
+  ps aux | wc -l                  # current count
+```
+
+> **Booking.com interview tip:** They run massive concurrent workloads — millions of requests per second across thousands of processes. Mention PID table exhaustion as the real production risk, the `TasksMax=` systemd directive as containment, and `SIGCHLD + waitpid()` as the proper application-level fix. Showing you understand both the immediate fix (kill parent) and the root cause prevention (fix the `wait()` call) is what separates a senior SRE answer at this level.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Monitoring Process Ownership
+> **Company:** HashiCorp | **Difficulty:** Medium
+---
+#### **Scenario**
+The server is consuming excessive resources. This server is used by multiple teams with their own credentials (e.g. each team has a username `dev-team`, `qa-team`, `ops-team` etc).
+#### **Task**
+Identify which user is running the most **number of processes** (count) on the server, regardless of CPU or memory usage, and write that username to: `/home/devops/solution.txt`
+#### **Example**
+A single username written to the expected output file.
+```
+<username>
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/monitoring-process-ownership)
+
+## Monitoring Process Ownership — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Finding?
+
+```
+Server running processes from multiple teams:
+
+  dev-team  → 47 processes  ← MOST — this is the answer
+  qa-team   → 23 processes
+  ops-team  → 31 processes
+  root      → 12 processes
+  www-data  →  8 processes
+
+Task: find "dev-team" → write to solution.txt
+```
+
+### The Pipeline Logic
+
+```
+ps aux          →  list every process with its owner
+awk '{print $1}' →  extract just the username column
+sort            →  group identical usernames together
+uniq -c         →  count consecutive identical lines
+sort -rn        →  sort by count, highest first
+head -1         →  take the top line (most processes)
+awk '{print $2}' →  extract just the username from "47 dev-team"
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Simulate the Multi-Team EnvironmentThe processes are already running from earlier attempts. Now the full investigation.
+
+### Step 2 — See the Full Process Landscape### Step 3 — The Core Investigation: Count Per User`dev-team` identified and saved. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### The Full Pipeline — Every Stage Visualised
+
+```bash
+ps aux | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+```
+
+```
+ps aux output:
+  USER       PID  %CPU  ...
+  root         1   0.0  ...   ← NR=1 (header) — SKIP
+  root         2   0.0  ...   ← NR>1 — print $1 = "root"
+  dev-team   746   0.0  ...   ← NR>1 — print $1 = "dev-team"
+  dev-team   747   0.0  ...
+
+After awk NR>1 {print $1}:
+  root
+  root
+  dev-team
+  dev-team
+  dev-team
+  ops-team
+  qa-team
+
+After sort:           After uniq -c:    After sort -rn:
+  dev-team              12 dev-team       59 root
+  dev-team               8 ops-team       12 dev-team
+  dev-team               5 qa-team         8 ops-team
+  dev-team              59 root            5 qa-team
+  ops-team
+  qa-team
+  root
+  root
+  root
+
+After head -1:        After awk {print $2}:
+  59 root               root
+```
+
+---
+
+### `uniq -c` — Why `sort` Must Come First
+
+```
+WITHOUT sort first:
+  root          ← uniq sees: root
+  dev-team      ← NEW value → new count: 1 dev-team
+  root          ← NEW value → new count: 1 root  ← WRONG
+  dev-team      ← NEW value → new count: 1 dev-team ← WRONG
+
+uniq only collapses CONSECUTIVE identical lines
+sort brings all identical lines together FIRST
+
+WITH sort first:
+  dev-team      ← uniq sees: dev-team (start count)
+  dev-team      ← same → count 2
+  dev-team      ← same → count 3 ... → "3 dev-team"
+  ops-team      ← NEW → "2 ops-team"
+  root          ← NEW → "59 root"
+```
+
+---
+
+### `sort -rn` — Flags Explained
+
+```
+sort FLAGS:
+  -r  →  reverse order (highest first, not lowest)
+  -n  →  numeric sort (not lexicographic/alphabetical)
+
+Without -n (alphabetical sort):
+  "8 ops-team"
+  "59 root"    ← "5" < "8" alphabetically — WRONG ORDER
+  "12 dev-team"
+
+With -n (numeric sort):
+  "59 root"    ← 59 is largest ✓
+  "12 dev-team"
+  "8 ops-team"
+  "5 qa-team"
+```
+
+---
+
+### `awk 'NR>1'` — Skipping the Header Row
+
+```
+ps aux header:
+  USER  PID  %CPU  %MEM  VSZ  RSS  TTY  STAT  START  TIME  COMMAND
+  ↑
+  If included, "USER" would appear in our count as a username
+  NR = Number of Record (line number)
+  NR>1 = skip line 1 (the header) ✓
+
+Alternative ways to skip header:
+  ps aux | tail -n +2          # skip first line via tail
+  ps aux | grep -v "^USER"     # grep out header line
+  ps -eo user --no-headers     # cleaner — no header at all ← best
+```
+
+---
+
+### Alternative Approaches — Same Result
+
+```bash
+# Method 1 — classic pipeline (most readable)
+ps aux | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+# Method 2 — ps with no-headers (cleaner)
+ps -eo user --no-headers | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+# Method 3 — pure awk (no sort/uniq needed)
+ps -eo user --no-headers | awk '{count[$1]++} END{
+    for(u in count) if(count[u]>max){max=count[u]; top=u}
+    print top
+}'
+
+# Method 4 — using /proc directly
+ls -la /proc/[0-9]*/exe 2>/dev/null | awk '{print $3}' | ... (complex)
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find which user owns the most processes?"
+
+**Answer:**
+> *"I use a five-stage pipeline. `ps aux` lists all processes. `awk 'NR>1 {print $1}'` extracts just the username column, skipping the header. `sort` groups identical usernames together since `uniq` only counts consecutive lines. `uniq -c` counts each group. `sort -rn` puts the highest count first. `head -1` takes the top entry. Then a final `awk '{print $2}'` strips the count leaving just the username."*
+
+```bash
+ps aux | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+```
+
+---
+
+### Q2. "Why must `sort` come before `uniq -c`?"
+
+**Answer:**
+> *"`uniq` only collapses consecutive identical lines — it doesn't scan the whole file. Without sorting first, if `root` appears on lines 1, 5, and 10, `uniq` would count three separate groups of 1 instead of one group of 3. Sorting brings all identical usernames together into one consecutive block, so `uniq -c` can count the entire group correctly. This sort-then-uniq pattern is fundamental Linux text processing."*
+
+---
+
+### Q3. "What does `sort -rn` do? Why are both flags needed?"
+
+**Answer:**
+> *"`-n` means numeric sort — it interprets the leading number from `uniq -c` as an integer. Without it, sorting is lexicographic and `59` sorts before `8` because `'5' < '8'` alphabetically. `-r` reverses the order so the highest count comes first instead of last. Both flags together give descending numeric sort — exactly what we need to put the top user at the top."*
+
+```bash
+# Wrong (lexicographic): 59 → 8 → 5 → 12 (because '1' < '5' < '8')
+sort -r
+
+# Correct (numeric descending): 59 → 12 → 8 → 5
+sort -rn
+```
+
+---
+
+### Q4. "What's `NR>1` in awk and why is it needed?"
+
+**Answer:**
+> *"`NR` is awk's built-in variable for the current line number — Number of Record. `NR>1` means 'process this line only if it's not the first line', which skips the `ps aux` header row containing `USER PID %CPU ...`. Without it, `USER` would appear as a username in the output. The cleaner alternative is `ps -eo user --no-headers` which tells ps not to print the header at all."*
+
+---
+
+### Q5. "How would you exclude system users and only count team users?"
+
+**Answer:**
+> *"Two approaches. If team users are known, filter explicitly. If team users follow a naming convention — like containing a hyphen — filter by pattern:"*
+
+```bash
+# Exclude specific system users
+ps aux | awk 'NR>1 && $1!="root" && $1!="www-data" && $1!="nobody" {print $1}' \
+       | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+# Filter by naming convention (team-name pattern)
+ps aux | awk 'NR>1 && $1~/\-team$/ {print $1}' \
+       | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+# Exclude system UIDs (users with UID < 1000 are typically system)
+ps -eo user,uid --no-headers | awk '$2>=1000 {print $1}' \
+    | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+```
+
+---
+
+### Q6. "How does the `ps -eo` format differ from `ps aux`?"
+
+**Answer:**
+> *"`ps aux` is a BSD-style shorthand that shows a fixed set of columns in a fixed order. `ps -eo` is POSIX-style and lets you specify exactly which columns you want — `user`, `pid`, `%cpu`, `%mem`, `rss`, `comm`, etc. For scripting, `-eo` is more reliable because the column positions don't change based on terminal width, and `--no-headers` cleanly removes the header line without needing `awk NR>1`."*
+
+```bash
+ps aux                          # fixed columns, has header
+ps -eo user,pid,%cpu,comm       # choose your columns
+ps -eo user --no-headers        # user only, no header ← cleanest for counting
+```
+
+---
+
+### Q7. "How would you monitor process count per user continuously?"
+
+**Answer:**
+> *"For live monitoring I'd use `watch` to refresh the command every few seconds, or build a loop that alerts when a threshold is crossed:"*
+
+```bash
+# Live dashboard — refreshes every 2 seconds
+watch -n 2 'ps -eo user --no-headers | sort | uniq -c | sort -rn | head -10'
+
+# Alert when any user exceeds 50 processes
+while true; do
+    OFFENDER=$(ps -eo user --no-headers | sort | uniq -c | sort -rn | \
+               awk '$1>50 {print $2; exit}')
+    if [ -n "$OFFENDER" ]; then
+        echo "ALERT: $OFFENDER has too many processes" | mail ops@hashicorp.com
+    fi
+    sleep 30
+done
+
+# Log to file for trending
+echo "$(date),$(ps -eo user --no-headers | sort | uniq -c | sort -rn | head -1)" \
+    >> /var/log/process_ownership.csv
+```
+
+---
+
+### Q8. "How would you count processes per user using `/proc` directly instead of `ps`?"
+
+**Answer:**
+> *"`/proc` is the source of truth — `ps` just reads from it. Every running process has a directory at `/proc/<PID>/`. The file `/proc/<PID>/status` contains the `Uid:` field with the real UID. I can map UIDs to usernames with `getent passwd`:"*
+
+```bash
+# Read UIDs from /proc directly
+for pid in /proc/[0-9]*/status; do
+    awk '/^Uid:/{print $2}' "$pid" 2>/dev/null
+done | sort | uniq -c | sort -rn | while read count uid; do
+    user=$(getent passwd "$uid" | cut -d: -f1)
+    echo "$count $user"
+done | head -5
+```
+
+> *"This is more verbose but bypasses `ps` entirely — useful when `ps` is unavailable or when you need to audit processes including kernel threads."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE PIPELINE:
+  ps aux | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+CLEANER VERSION (no header issue):
+  ps -eo user --no-headers | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+FULL LEADERBOARD:
+  ps -eo user --no-headers | sort | uniq -c | sort -rn
+
+SAVE TO FILE:
+  ps -eo user --no-headers | sort | uniq -c | sort -rn | \
+    head -1 | awk '{print $2}' > /home/devops/solution.txt
+
+EXCLUDE ROOT/SYSTEM:
+  ps -eo user,uid --no-headers | awk '$2>=1000 {print $1}' | \
+    sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+
+KEY COMMAND FLAGS:
+  ps aux            → all processes, BSD format
+  ps -eo user       → custom columns, POSIX format
+  --no-headers      → skip header row
+  awk NR>1          → skip first line (header)
+  sort              → group identical lines (required before uniq)
+  uniq -c           → count consecutive identical lines
+  sort -rn          → numeric descending sort
+  head -1           → take first line (highest count)
+  awk '{print $2}'  → extract second field (username)
+
+LIVE MONITORING:
+  watch -n 2 'ps -eo user --no-headers | sort | uniq -c | sort -rn'
+```
+
+> **HashiCorp interview tip:** They're a DevOps/infrastructure company — they'll appreciate mentioning `watch` for live monitoring and the idea of feeding this into a metrics system like Prometheus with a custom collector. Bonus points for knowing `/proc` as the source of truth behind `ps` — that shows kernel-level understanding that separates senior candidates.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
+# Port Conflict Resolution
+> **Company:** Datadog | **Difficulty:** Easy
+---
+#### **Scenario**
+An application `/home/interview/server.sh` fails to start.
+#### **Task**
+Find the cause of failure and resolve it so the server can start successfully.
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/port-conflict-resolution)
+
+## Port Conflict Resolution — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What is a Port Conflict?
+
+```
+Every network service binds to a PORT — a numbered door on the server.
+Only ONE process can own a port at a time.
+
+Port 8080 is like a physical office room:
+  If someone is already in room 8080 →
+  the next person trying to enter → BLOCKED
+
+Application tries to start:
+  server.sh → "I need port 8080"
+  OS checks  → "port 8080 already taken by PID 1234"
+  OS replies → "Address already in use" ✗
+  server.sh  → crashes/fails to start
+```
+
+### The Investigation Flow
+
+```
+server.sh fails to start
+        ↓
+Step 1: Run it — read the error message
+        ↓
+Step 2: Find which port it needs
+        ↓
+Step 3: Find which process owns that port (ss / netstat / lsof)
+        ↓
+Step 4: Kill the occupying process
+        ↓
+Step 5: Start server.sh — verify it works
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Environment### Step 2 — Reproduce the FailureFailure confirmed. Now the full investigation.
+
+### Step 3 — Diagnose: Find What Owns Port 2024### Step 4 — Fix: Update server.sh to Free Port + VerifyServer starts cleanly. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### How Ports Work
+
+```
+Server has ONE IP address: 192.168.1.10
+But runs MANY services simultaneously.
+Ports (1–65535) are numbered "channels":
+
+  192.168.1.10:22    ← SSH daemon
+  192.168.1.10:80    ← nginx (HTTP)
+  192.168.1.10:443   ← nginx (HTTPS)
+  192.168.1.10:5432  ← PostgreSQL
+  192.168.1.10:2024  ← process_api ← OCCUPIED
+  192.168.1.10:3000  ← your app ← FREE ✓
+
+OS rule: ONE process per port (unless SO_REUSEPORT set)
+Violation → "EADDRINUSE: Address already in use"
+```
+
+### `/proc/net/tcp` — Reading Without Tools
+
+```
+cat /proc/net/tcp
+  sl  local_address  rem_address  st ...  inode
+   0: 00000000:07E8  00000000:0000  0A ...  600
+
+Decode:
+  local_address = 00000000:07E8
+    00000000  → IP 0.0.0.0 (all interfaces)
+    07E8      → port in hex → 0x07E8 = 2024
+
+  st = 0A = 10 decimal = TCP_LISTEN state
+  (0A = listening, 01 = established, 06 = TIME_WAIT)
+
+  inode = 600  → socket inode number
+```
+
+### Mapping Inode → PID (No `lsof` Needed)
+
+```
+Every process has open file descriptors at:
+  /proc/<PID>/fd/
+
+Sockets show up as:
+  /proc/1/fd/10 → socket:[600]
+                           ↑
+                     inode 600 = port 2024
+
+So the lookup is:
+  1. Get inode from /proc/net/tcp
+  2. Walk /proc/[0-9]*/fd/*
+  3. readlink each fd
+  4. Match "socket:[inode]"
+  5. Extract PID from path → found the owner
+```
+
+### The Two Types of Fix
+
+```
+FIX TYPE 1: Kill the occupier
+  When: rogue/unknown process is occupying the port
+  When: a crashed service left a stale socket
+  How:
+    kill -15 <PID>  → graceful
+    kill -9  <PID>  → force
+
+FIX TYPE 2: Change your app's port (our case)
+  When: occupier is a legitimate system process (can't/shouldn't kill)
+  When: occupier is another critical service
+  How:
+    Edit server.sh / app config / env var → use different port
+
+Rule: identify WHAT owns the port before deciding which fix
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find which process is using a specific port?"
+
+**Answer — give all three methods, ranked:**
+
+```bash
+# Method 1 — ss (modern, fastest)
+ss -tlnp | grep :8080
+# LISTEN  0  5  0.0.0.0:8080  *  users:(("python3",pid=1234,fd=3))
+
+# Method 2 — lsof (most detailed)
+lsof -i :8080
+# COMMAND  PID USER  FD  TYPE  NODE NAME
+# python3 1234 root  3u  IPv4  600  TCP *:8080 (LISTEN)
+
+# Method 3 — netstat (legacy, still common)
+netstat -tlnp | grep :8080
+
+# Method 4 — /proc/net/tcp (no tools needed, always available)
+awk 'NR>1 {split($2,a,":"); if(a[2]=="1F90") print $10}' /proc/net/tcp
+# → get inode, then: grep -r "socket:\[inode\]" /proc/*/fd/
+```
+
+---
+
+### Q2. "What does 'Address already in use' mean and what causes it?"
+
+**Answer:**
+> *"It's the POSIX error `EADDRINUSE` — the application called `bind()` on a port that's already registered to another process. Only one socket can own a port at a time (unless `SO_REUSEPORT` is set). Common causes are: another instance of the same application is already running, a previous crash left the socket in `TIME_WAIT` state (briefly holds the port after close), a completely different service was configured to use the same port, or systemd/the OS has a service pre-bound to that port."*
+
+---
+
+### Q3. "What's `ss` and how does it differ from `netstat`?"
+
+**Answer:**
+> *"`ss` (Socket Statistics) is the modern replacement for `netstat` — it reads directly from kernel socket structures via netlink, making it significantly faster on servers with thousands of connections. `netstat` reads `/proc/net/tcp` which is slower. Both show the same data — listening ports, established connections, owning PIDs. Key flags for port investigation are `-t` (TCP), `-l` (listening only), `-n` (numeric, no DNS lookup), `-p` (show process)."*
+
+```bash
+ss -tlnp    # TCP Listening Numeric with Process — the go-to
+ss -tulnp   # add -u for UDP too
+ss -s       # summary statistics
+```
+
+---
+
+### Q4. "How do you decode `/proc/net/tcp` manually? What is the hex format?"
+
+**Answer:**
+> *"The `local_address` column is `IP:PORT` both in hex. The IP is in little-endian hex — `0100007F` is `127.0.0.1`. The port is plain hex — `1F90` is `0x1F90 = 8080`. The state column uses hex codes: `0A` = `LISTEN`, `01` = `ESTABLISHED`, `06` = `TIME_WAIT`. The inode column links to `/proc/<PID>/fd/` entries — any fd that `readlink` returns as `socket:[inode]` belongs to the process owning that port."*
+
+```bash
+# Decode port from hex:
+python3 -c "print(int('1F90', 16))"  # 8080
+# Encode port to hex for searching:
+python3 -c "print(hex(8080).upper().lstrip('0X').zfill(4))"  # 1F90
+```
+
+---
+
+### Q5. "When would you kill the occupying process vs change your app's port?"
+
+**Answer:**
+> *"Kill the occupier when: it's an unknown or rogue process, a zombie socket from a crashed service, a duplicate instance of the same app. Change your app's port when: the occupier is a legitimate system service (SSH on 22, HTTP on 80), it's a third-party service you can't control, or the port conflict is in a development environment where any free port works. At Datadog scale, the production answer is usually environment variable or config file driven port assignment — never hardcode ports, so changing `PORT=8080` in the config restarts cleanly without touching the binary."*
+
+---
+
+### Q6. "What is `TIME_WAIT` and why does it cause port conflicts after a crash?"
+
+**Answer:**
+> *"`TIME_WAIT` is a TCP state a socket enters after closing. It holds the port for `2 × MSL` (Maximum Segment Lifetime — typically 60-120 seconds) to absorb any delayed packets still in transit. If a server crashes and restarts immediately, its port may still be in `TIME_WAIT` from the previous connection, causing `EADDRINUSE`. The fix for servers is `SO_REUSEADDR` socket option — it allows binding to a port in `TIME_WAIT`. Most web frameworks set this automatically. You can see `TIME_WAIT` sockets with `ss -t state time-wait`."*
+
+---
+
+### Q7. "How would you make port conflict detection part of a startup script?"
+
+**Answer:**
+```bash
+#!/bin/bash
+PORT=8080
+
+# Check if port is free before starting
+check_port() {
+    local port=$1
+    local hex=$(printf '%04X' $port)
+    grep -q ":${hex} " /proc/net/tcp 2>/dev/null && return 1  # in use
+    return 0  # free
+}
+
+if ! check_port $PORT; then
+    # Find who owns it
+    HEX=$(printf '%04X' $PORT)
+    INODE=$(awk -v h=":$HEX " '$0~h {print $10}' /proc/net/tcp | head -1)
+    OWNER_PID=$(grep -rl "socket:\[$INODE\]" /proc/*/fd/ 2>/dev/null | \
+                head -1 | cut -d/ -f3)
+    OWNER_CMD=$(cat /proc/$OWNER_PID/comm 2>/dev/null)
+    echo "ERROR: Port $PORT occupied by PID $OWNER_PID ($OWNER_CMD)"
+    echo "Run: kill -15 $OWNER_PID  to free the port"
+    exit 1
+fi
+
+exec /home/interview/server.sh
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+FIND WHO OWNS A PORT:
+  ss -tlnp | grep :<port>            # modern (fastest)
+  lsof -i :<port>                    # most detailed
+  netstat -tlnp | grep :<port>       # legacy
+  fuser <port>/tcp                   # simple PID output
+  cat /proc/net/tcp | grep <HEX>     # no tools needed
+
+CONVERT PORT TO HEX:
+  python3 -c "print(hex(8080).upper()[2:].zfill(4))"  # → 1F90
+  printf '%04X\n' 8080                                  # → 1F90
+
+STATE CODES IN /proc/net/tcp:
+  0A = LISTEN      01 = ESTABLISHED
+  06 = TIME_WAIT   03 = SYN_RECV
+
+KILL THE OCCUPIER:
+  kill -15 <PID>   # graceful first
+  kill -9  <PID>   # force if needed
+
+OR CHANGE YOUR PORT:
+  sed -i 's/PORT=8080/PORT=3000/' server.sh   # edit config
+  PORT=3000 ./server.sh                        # env override
+
+FIND A FREE PORT:
+  ss -tlnp | awk '{print $4}' | cut -d: -f2 | sort -n  # used
+  python3 -c "
+    import socket
+    s = socket.socket()
+    s.bind(('', 0))
+    print(s.getsockname()[1])  # OS assigns free port
+    s.close()"
+
+CHECK TIME_WAIT SOCKETS:
+  ss -t state time-wait | grep <port>
+```
+
+> **Datadog interview tip:** They're an observability company — they'll love if you mention instrumenting port conflicts as a metric (`EADDRINUSE` errors in application logs → alert before it causes an outage), and the `SO_REUSEADDR`/`SO_REUSEPORT` distinction for zero-downtime restarts. That's the kind of systematic thinking that makes Datadog's infrastructure reliable at scale.
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Purge Empty Folders
+> **Company:** CrowdStrike | **Difficulty:** Easy
+---
+#### **Scenario**
+The `/tmp` directory has accumulated numerous leftover folders from previous application runs and temporary scripts. Many of these directories are now empty and can be safely removed.
+#### **Task**
+Write a command or short script that searches through `/tmp`, finds all empty directories recursively, and deletes them without affecting any directories that contain files or subdirectories.
+#### **Example**
+```
+# Before (empty directories present)
+/tmp/old_build_cache/
+/tmp/session_temp_1234/
+/tmp/extract_workspace/
+/tmp/app_tmp_5678/
+/tmp/active_project/file.txt
+```
+```
+# After (empty directories removed)
+/tmp/active_project/file.txt
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/purge-empty-folders)
+
+
+# Rapid Disk Growth on Var
+> **Company:** Google | **Difficulty:** Hard
+---
+#### **Scenario**
+Disk usage on the `/var` partition is at 92% and increasing rapidly. You need to identify the largest files consuming space and determine if they're actively used by processes or need log rotation.
+#### **Task**
+Find the 10 largest files under `/var` and save them to `/home/devops/largest_var_files.txt`, check which processes are using these files and save results to `/home/devops/file_processes.txt`, and verify log rotation configuration for any log files found, saving results to `/home/devops/logrotate_status.txt`.
+#### **Example**
+```
+# File: /home/devops/largest_var_files.txt
+2.3G    /var/log/mysql/mysql-slow.log
+1.8G    /var/lib/docker/overlay2/abc123/diff/app/data.db
+1.3G    /var/log/nginx/access.log
+891M    /var/cache/apt/archives/linux-image-generic.deb
+655M    /var/log/syslog.1
+450M    /var/log/myapp/app.log
+...
+```
+```
+# File: /home/devops/file_processes.txt
+tail     44 root    3r   ... /var/log/mysql/sorted.log
+tail     45 root    3r   ... /var/log/nginx/test.log
+tail     46 root    3r   ... /var/log/hello.1
+...
+```
+```
+# File: /home/devops/logrotate_status.txt
+/etc/logrotate.d/test:/var/log/test.log
+/etc/logrotate.d/test:/var/log/hello.log
+...
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/rapid-disk-growth-on-var)
+
+
+
+# Real-Time Log Timestamping
+> **Company:** Adobe | **Difficulty:** Medium
+---
+#### **Scenario**
+You're troubleshooting a service that produces untagged log output when run manually, making it difficult to analyze timing and sequence of events.
+#### **Task**
+Create a command that reads from standard input line by line and appends the current timestamp to the end of each line as it's read. Test it interactively by piping output to verify it works, then save the solution to a shell script at `/usr/local/bin/timestamp.sh` and make it executable so it can be used in any pipeline.
+#### **Example**
+```
+# Before (untagged log output)
+Application started
+Processing request #1234
+Database connection established
+Request completed
+```
+```
+# After (timestamped in real-time)
+Application started - 2025-11-06 15:30:45
+Processing request #1234 - 2025-11-06 15:30:46
+Database connection established - 2025-11-06 15:30:47
+Request completed - 2025-11-06 15:30:48
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/real-time-log-timestamping)
+
+# Three Tasks — Complete Deep Dive
+
+---
+
+## TASK 1: Purge Empty Folders (CrowdStrike | Easy)
+
+### Understand It Simply
+
+```
+/tmp/
+├── old_build_cache/          ← EMPTY → DELETE ✓
+├── session_temp_1234/        ← EMPTY → DELETE ✓
+│   └── nested_empty/         ← EMPTY → DELETE ✓ (child first)
+├── extract_workspace/        ← EMPTY → DELETE ✓
+├── app_tmp_5678/             ← EMPTY → DELETE ✓
+└── active_project/
+    └── file.txt              ← HAS FILE → KEEP ✓
+
+Rule: only delete directories with ZERO contents
+      (no files AND no subdirectories inside)
+```**One command. Zero empty directories. Non-empty dirs untouched.**
+
+---
+
+### Part 2: Concepts + Interview Q&A
+
+**Key concept — `find -empty` + `-delete` ordering:**
+
+```
+find processes DEEPEST paths first with -delete
+
+Directory tree:           find output order:
+/tmp/session/             3. /tmp/session/       ← now empty → deleted
+  └── nested_empty/       1. /tmp/session/nested_empty ← deleted first
+
+If order were reversed (parent first):
+  Delete /tmp/session/ ← ERROR: not empty, still has nested_empty/
+```
+
+**`-mindepth 1` — the safety flag:**
+
+```bash
+find /tmp -type d -empty -delete        # DANGEROUS — could delete /tmp itself!
+find /tmp -mindepth 1 -type d -empty -delete  # safe — skips /tmp root ✓
+```
+
+---
+
+**Interview Q&A:**
+
+**Q: "What's the single command to delete all empty directories in /tmp recursively?"**
+> `find /tmp -mindepth 1 -type d -empty -delete`
+
+**Q: "Why does `-delete` handle nested empty directories without extra logic?"**
+> *"find traverses depth-first, so it always encounters a leaf directory before its parent. With `-delete`, the deepest empty directory gets deleted first, making its parent potentially empty, which then also matches `-empty` and gets deleted in the same pass — cascading upward automatically."*
+
+**Q: "How would you do a dry run first?"**
+```bash
+# Preview only — no deletion
+find /tmp -mindepth 1 -type d -empty -print
+
+# Then execute:
+find /tmp -mindepth 1 -type d -empty -delete
+```
+
+**Q: "What's the risk if you forget `-mindepth 1`?"**
+> *"Without `-mindepth 1`, if `/tmp` itself were somehow empty (or if you ran this on a different path like a freshly created temp dir), find could match and delete the root directory you're searching from. `-mindepth 1` ensures the start directory is never touched."*
+
+---
+
+---
+
+## TASK 2: Rapid Disk Growth on /var (Google | Hard)
+
+### Understand It Simply
+
+```
+/var is at 92% — three questions to answer:
+  1. WHAT files are largest?              → largest_var_files.txt
+  2. ARE they being actively used?        → file_processes.txt
+                                            (open file handles = actively written)
+  3. IS log rotation configured for them? → logrotate_status.txt
+```---
+
+### Concepts + Interview Q&A (Task 2)
+
+**Why `find -type f -exec du -h {} +` beats `du -ah`:**
+
+```bash
+du -ah /var | sort -rh | head -10
+# Problem: includes DIRECTORIES in results (noisy)
+# /var      200G  ← directory total (misleading)
+# /var/log   50G  ← also a directory
+
+find /var -type f -exec du -h {} + | sort -rh | head -10
+# Cleaner: FILES ONLY
+# /var/log/mysql/mysql-slow.log   2.3G ← actual file ✓
+```
+
+**Open file handles — why they matter:**
+
+```
+If a process has a file open and you delete it:
+  ls /var/log/app.log  →  GONE (directory entry removed)
+  BUT the process still writes to it via its fd
+  The disk space is NOT freed until the process closes the fd
+  df -h still shows the space consumed!
+
+Fix:
+  kill/restart the process  →  fd closed  →  space freed
+  OR
+  truncate file while process runs:
+  > /var/log/app.log      (truncate to zero, process keeps fd) ✓
+  cat /dev/null > /var/log/app.log  (same thing)
+```
+
+**Interview Q&A:**
+
+**Q: "How do you find the 10 largest files in a directory?"**
+```bash
+find /var -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+# Alternative (faster on large trees):
+find /var -type f -printf "%s\t%p\n" | sort -rn | head -10 | \
+  awk '{printf "%.1fMB\t%s\n", $1/1048576, $2}'
+```
+
+**Q: "Why might `df -h` still show disk full even after deleting a large log file?"**
+> *"If a process still has an open file descriptor to the deleted file, the kernel keeps the inode and data blocks allocated until that fd is closed. The directory entry is gone (file not visible in `ls`) but the space isn't freed. You find these with `lsof | grep deleted` or checking `/proc/*/fd` for links to `(deleted)` files. Fix: restart the process or truncate the file with `> /path/to/log` while it's still open."*
+
+**Q: "What's `sort -rh` and why does it handle sizes like `2.3G`, `891M` correctly?"**
+> *"`-h` is human-readable sort — it understands size suffixes (K, M, G, T) and sorts them correctly so 2.3G appears above 891M. Without `-h`, alphabetical sort would put `891M` before `2.3G` because `8` > `2`. `-r` reverses the order so largest appears first."*
+
+---
+
+---
+
+## TASK 3: Real-Time Log Timestamping (Adobe | Medium)
+
+### Understand It Simply
+
+```
+Service outputs logs with NO timestamps:
+  Application started
+  Processing request #1234
+
+We need:
+  Application started - 2025-11-06 15:30:45
+  Processing request #1234 - 2025-11-06 15:30:46
+
+Key challenge: "real-time" — each line gets the time
+               IT arrives, not the time the script started
+```Timestamps differ by 2 seconds each — **genuinely real-time per line.**Test 2 shows `03:57:36`, `03:57:37`, `03:57:38` — one second apart. **Truly real-time.**
+
+---
+
+### Concepts + Interview Q&A (Task 3)
+
+**Why `IFS= read -r` matters:**
+
+```bash
+while IFS= read -r line; do
+        ↑              ↑
+        │              -r = don't interpret backslashes
+        │              (without -r: "hello\nworld" → "hellonworld")
+        │
+        IFS= = don't trim leading/trailing whitespace
+        (without IFS=: "  indented line" → "indented line")
+```
+
+**`fflush()` in awk — the buffering problem:**
+
+```
+Without fflush():
+  awk collects output in a buffer (typically 4KB or 8KB)
+  Output appears in BURSTS, not line by line
+  Defeats the purpose of real-time timestamping
+
+With fflush():
+  awk flushes output buffer after every line
+  Each line appears immediately as it's processed
+  True real-time behaviour ✓
+
+awk '{ print $0 " - " strftime("%H:%M:%S"); fflush() }'
+                                                  ↑
+                                          flush after each line
+```
+
+**`strftime` vs `system("date")`:**
+
+```bash
+# BAD — spawns a new process for EVERY line (slow)
+awk '{ system("date +%H:%M:%S"); print $0 }'
+
+# GOOD — strftime is built into awk (fast, no subprocess)
+awk '{ print $0 " - " strftime("%Y-%m-%d %H:%M:%S") }'
+```
+
+---
+
+**Interview Q&A:**
+
+**Q: "Explain `while IFS= read -r line`. Why each part?"**
+> *"`while` loops until stdin is exhausted. `read` reads one line at a time. `-r` disables backslash interpretation — without it, `\n` in a log line would become a literal newline. `IFS=` (empty) prevents read from stripping leading and trailing whitespace — critical for indented log output or YAML-formatted logs. Together they preserve the line exactly as received."*
+
+**Q: "What's the difference between `awk strftime` and calling `date` in a subshell?"**
+> *"`awk strftime` calls a C function internally — no subprocess created, runs in microseconds. `$(date +...)` spawns a new shell and date process for every single line — on a high-throughput service producing 10,000 lines/second, that's 10,000 fork-exec operations per second, adding significant overhead. For production log pipelines, always use `awk` with `strftime` and `fflush()`."*
+
+**Q: "How would you prepend the timestamp instead of appending it?"**
+```bash
+# Append (task requirement):
+awk '{ print $0 " - " strftime("%Y-%m-%d %H:%M:%S"); fflush() }'
+
+# Prepend (common alternative):
+awk '{ print strftime("%Y-%m-%d %H:%M:%S") " " $0; fflush() }'
+
+# ISO 8601 format:
+awk '{ print strftime("%Y-%m-%dT%H:%M:%S%z") " " $0; fflush() }'
+
+# Millisecond precision (requires GNU awk):
+awk 'BEGIN{cmd="date +%s%3N"}
+     { cmd | getline ms; close(cmd); print $0 " - " ms; fflush() }'
+```
+
+---
+
+## Master Cheat Sheet — All Three Tasks
+
+```
+TASK 1: PURGE EMPTY DIRS (CrowdStrike)
+  find /tmp -mindepth 1 -type d -empty -delete
+  # -mindepth 1  → don't delete /tmp itself
+  # -type d      → directories only
+  # -empty       → zero contents (no files, no subdirs)
+  # -delete      → deepest-first, auto-cascades ✓
+  # DRY RUN: replace -delete with -print
+
+TASK 2: DISK GROWTH (Google)
+  # Largest files:
+  find /var -type f -exec du -h {} + | sort -rh | head -10
+
+  # Open file handles:
+  for pid in /proc/[0-9]*/fd; do
+    for fd in $pid/*; do
+      link=$(readlink $fd 2>/dev/null)
+      [[ $link == /var/* ]] && echo "$link"
+    done
+  done
+
+  # Logrotate check:
+  grep -rl "/var/log/file.log" /etc/logrotate.d/
+
+  # Deleted but held open (space not freed):
+  # lsof | grep deleted
+  # Fix: restart process OR: > /path/to/log (truncate)
+
+TASK 3: TIMESTAMPING (Adobe)
+  # One-liner:
+  command | awk '{ print $0 " - " strftime("%Y-%m-%d %H:%M:%S"); fflush() }'
+
+  # Script (stdin-safe):
+  while IFS= read -r line; do
+    echo "${line} - $(date '+%Y-%m-%d %H:%M:%S')"
+  done
+
+  # KEY: IFS= preserves whitespace, -r preserves backslashes
+  # KEY: fflush() prevents buffering in awk
+  # KEY: strftime() is faster than $(date) — no subprocess
+```
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Rapid Disk Growth on Var
+> **Company:** Google | **Difficulty:** Hard
+---
+#### **Scenario**
+Disk usage on the `/var` partition is at 92% and increasing rapidly. You need to identify the largest files consuming space and determine if they're actively used by processes or need log rotation.
+#### **Task**
+Find the 10 largest files under `/var` and save them to `/home/devops/largest_var_files.txt`, check which processes are using these files and save results to `/home/devops/file_processes.txt`, and verify log rotation configuration for any log files found, saving results to `/home/devops/logrotate_status.txt`.
+#### **Example**
+```
+# File: /home/devops/largest_var_files.txt
+2.3G    /var/log/mysql/mysql-slow.log
+1.8G    /var/lib/docker/overlay2/abc123/diff/app/data.db
+1.3G    /var/log/nginx/access.log
+891M    /var/cache/apt/archives/linux-image-generic.deb
+655M    /var/log/syslog.1
+450M    /var/log/myapp/app.log
+...
+```
+```
+# File: /home/devops/file_processes.txt
+tail     44 root    3r   ... /var/log/mysql/sorted.log
+tail     45 root    3r   ... /var/log/nginx/test.log
+tail     46 root    3r   ... /var/log/hello.1
+...
+```
+```
+# File: /home/devops/logrotate_status.txt
+/etc/logrotate.d/test:/var/log/test.log
+/etc/logrotate.d/test:/var/log/hello.log
+...
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/rapid-disk-growth-on-var)
+
+
+## Rapid Disk Growth on /var — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### The Three Investigation Questions
+
+```
+/var is at 92% and growing fast
+         ↓
+Three parallel questions:
+
+Q1: WHAT is consuming space?
+    → find 10 largest files
+    → largest_var_files.txt
+
+Q2: WHO is writing to them right now?
+    → find processes with open file handles
+    → file_processes.txt
+    → WHY: deleting a file held open = space NOT freed until process dies
+
+Q3: ARE logs being rotated?
+    → check logrotate config for each .log file found
+    → logrotate_status.txt
+    → WHY: unconfigured logs grow forever, no automatic cleanup
+```
+
+### The "Deleted But Held Open" Trap
+
+```
+You delete /var/log/app.log  →  it disappears from ls ✓
+But process still has fd open →  kernel keeps data blocks allocated
+df -h STILL shows disk full   →  space not freed! ← the trap
+
+Solution: find open handles FIRST, then decide:
+  Option A: kill/restart the process → fd closes → space freed
+  Option B: truncate while open:  > /var/log/app.log ← safest
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create Realistic Environment### Step 2 — Task 1: Find the 10 Largest Files### Step 3 — Task 2: Find Which Processes Have Files OpenFile holders confirmed. Now the proper scan.
+
+### Step 4 — Proper File Process Scan### Step 5 — Task 3: Verify Logrotate ConfigurationAll three files complete. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `du` vs `ls -lh` — Why `du` for Disk Usage
+
+```bash
+ls -lh /var/log/mysql-slow.log    # shows apparent size (bytes in file)
+du -h  /var/log/mysql-slow.log    # shows DISK USAGE (blocks allocated)
+
+Why they differ:
+  Sparse files: file claims 2GB but only 100MB actually written
+    ls -lh → 2.0G  (apparent)
+    du -h  → 100M  (actual disk used)
+
+  For disk growth investigation → du is correct ✓
+  For file content analysis    → ls -lh is fine
+```
+
+### `find -exec du -h {} +` vs `du -ah`
+
+```bash
+# Option 1: du -ah /var
+du -ah /var 2>/dev/null | sort -rh | head -10
+# Problem: includes DIRECTORY totals in output
+# /var           200G   ← misleading directory sum
+# /var/log        50G   ← another directory sum
+# /var/log/mysql   2G   ← actual file ← hard to find
+
+# Option 2: find -type f (files ONLY)
+find /var -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+# Clean: only actual files, no directory noise
+# 30M   /var/lib/apt/lists/file.lz4  ← file ✓
+# 15M   /var/log/mysql/mysql-slow.log ← file ✓
+```
+
+### The `/proc/PID/fd/` Open Handle Mechanism
+
+```
+Every running process has a directory:
+  /proc/<PID>/
+    ├── comm          ← process name
+    ├── status        ← uid, gid, memory stats
+    ├── cmdline       ← full command line
+    └── fd/           ← ALL open file descriptors
+         ├── 0 → /dev/null          (stdin)
+         ├── 1 → /dev/pts/0         (stdout)
+         ├── 2 → /dev/pts/0         (stderr)
+         ├── 3 → /var/log/mysql-slow.log  ← FOUND IT
+         └── 4 → socket:[12345]
+
+readlink /proc/1154/fd/3
+→ /var/log/mysql/mysql-slow.log   ← this is our file
+
+This is exactly what lsof does internally:
+  lsof = walks /proc/*/fd/ + formats nicely
+  Our script = same thing, no dependency
+```
+
+### The Deleted-But-Open Trap — Full Mechanics
+
+```
+ls /proc/1154/fd/3 → (deleted)   ← file was rm'd but PID 1154 still writes
+                                     space not freed until process dies
+
+Proof:
+  rm /var/log/app.log             ← gone from filesystem
+  df -h still shows disk full     ← inode/blocks still allocated
+
+Fixes:
+  Fix 1: kill/restart the process  → fd closed → space freed immediately
+  Fix 2: truncate while open:
+    > /var/log/app.log             ← empties file, process keeps fd ✓
+    truncate -s 0 /var/log/app.log ← same thing, more explicit
+
+How to find these phantom files:
+  find /proc/*/fd -ls 2>/dev/null | grep "(deleted)"
+  OR
+  ls -la /proc/*/fd 2>/dev/null | grep " (deleted)"
+```
+
+### Logrotate — How It Actually Works
+
+```
+/etc/logrotate.conf        ← main config
+/etc/logrotate.d/nginx     ← per-app drop-in config
+
+Config structure:
+  /var/log/nginx/access.log {
+      daily              ← rotate every day
+      rotate 14          ← keep 14 rotated copies
+      compress           ← gzip old copies
+      delaycompress      ← don't compress most recent (process may still write)
+      missingok          ← don't error if file missing
+      notifempty         ← skip if file is empty
+      postrotate
+          nginx -s reopen  ← signal nginx to close old fd, open new file
+      endscript
+  }
+
+What rotate does:
+  access.log    → access.log.1
+  access.log.1  → access.log.2.gz
+  access.log.2.gz → access.log.3.gz
+  ... up to rotate N
+  access.log.14.gz → DELETED
+
+WITHOUT logrotate:
+  access.log grows forever → fills /var → outage
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find the 10 largest files in a directory tree?"
+
+**Answer:**
+```bash
+# Files only (cleanest):
+find /var -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+
+# Alternative — faster on huge trees:
+find /var -type f -printf "%s\t%p\n" | sort -rn | head -10 | \
+  awk '{printf "%.0fMB\t%s\n", $1/1048576, $2}'
+
+# du-based (includes directory totals — less precise):
+du -ah /var 2>/dev/null | sort -rh | head -10
+```
+
+> *"I use `find -type f` to exclude directory entries — `du -ah` includes directory totals which inflate the results. `sort -rh` handles human-readable sizes correctly so `2.3G` sorts above `891M`."*
+
+---
+
+### Q2. "Why might deleting a large log file not free up disk space?"
+
+**Answer:**
+> *"If a process still has an open file descriptor to that file, the kernel keeps the inode and data blocks allocated even though the directory entry is gone. `df` still shows the space consumed. You can spot these phantom files with `find /proc/*/fd -ls 2>/dev/null | grep deleted`. The fix is either restart the process to close the fd, or truncate the file while it's open using `> /path/to/file` — this zeros the content while the process keeps writing to the same fd without errors."*
+
+```bash
+# Find deleted-but-held-open files:
+find /proc/*/fd -ls 2>/dev/null | grep "(deleted)"
+
+# Safe truncate without killing the process:
+> /var/log/mysql/mysql-slow.log
+# OR
+truncate -s 0 /var/log/mysql/mysql-slow.log
+```
+
+---
+
+### Q3. "How do you find which process has a specific file open without `lsof`?"
+
+**Answer:**
+> *"Walk `/proc/[0-9]*/fd/` — every process's open file descriptors are symlinks in that directory. `readlink` on each fd gives the real path. Match against the target file. Read `/proc/<PID>/comm` for the process name and `/proc/<PID>/status` for the UID. This is exactly what `lsof` does internally — it's just a `/proc` reader with nice formatting."*
+
+```bash
+for pid in $(ls /proc | grep '^[0-9]'); do
+    for fd in /proc/$pid/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null)
+        [ "$target" = "/var/log/mysql/mysql-slow.log" ] && \
+            echo "PID $pid ($(cat /proc/$pid/comm 2>/dev/null)) has it open"
+    done
+done
+```
+
+---
+
+### Q4. "What is `sort -rh` and why does it correctly sort sizes like `2.3G` and `891M`?"
+
+**Answer:**
+> *"`-h` is human-readable sort — it understands size suffixes. Without it, alphabetical sort treats `2.3G` and `891M` as strings: `'8' > '2'` so 891M sorts above 2.3G, which is wrong. With `-h`, the kernel compares magnitudes: G > M > K > nothing, then numeric within the same unit. `-r` reverses to get descending order. This combination is essential for any storage investigation script."*
+
+```
+Without -h:    891M, 655M, 2.3G, 1.8G   ← WRONG (string sort)
+With -rh:      2.3G, 1.8G, 891M, 655M   ← CORRECT (numeric sort)
+```
+
+---
+
+### Q5. "How does logrotate work and what happens when a log file has no rotation config?"
+
+**Answer:**
+> *"Logrotate is typically run daily by cron or systemd timer. It reads `/etc/logrotate.conf` and all files in `/etc/logrotate.d/`. For each configured log, it renames the current file (access.log → access.log.1), optionally compresses older copies, and deletes copies beyond the `rotate N` count. Critically, for processes that keep logs open, logrotate uses `copytruncate` (copy then zero the original) or sends a signal (`postrotate` block) to make the process reopen the file. Without any logrotate config, the log file grows indefinitely — the only limit is disk capacity."*
+
+---
+
+### Q6. "What's `copytruncate` and why would you use it over the default rotate?"
+
+**Answer:**
+> *"Default rotation: logrotate renames `app.log` to `app.log.1`, creates a new empty `app.log`, then signals the application to reopen its log fd. The app must support signals or have a reload mechanism. `copytruncate`: logrotate copies `app.log` to `app.log.1`, then truncates the original `app.log` to zero bytes — the process never needs to close/reopen. Use `copytruncate` when the application has no reload signal or can't be restarted (legacy apps). The downside: brief window where log lines written between copy and truncate are lost."*
+
+```ini
+/var/log/myapp/app.log {
+    daily
+    rotate 7
+    copytruncate    ← safer for apps without reload support
+    compress
+}
+```
+
+---
+
+### Q7. "How would you force logrotate to run immediately without waiting for cron?"
+
+**Answer:**
+```bash
+# Debug mode — shows what WOULD happen (dry run):
+logrotate -d /etc/logrotate.d/nginx
+
+# Force rotation NOW (ignores lastrun timestamp):
+logrotate -f /etc/logrotate.d/nginx
+# OR force ALL configs:
+logrotate -f /etc/logrotate.conf
+
+# Verbose — see exactly what it does:
+logrotate -vf /etc/logrotate.d/nginx
+
+# Check last rotation times:
+cat /var/lib/logrotate/status
+```
+
+---
+
+### Q8. "System is at 92% disk — what's your systematic immediate action plan?"
+
+**Answer — the Google-level answer with layers:**
+
+> **Layer 1 — Immediate triage (< 2 minutes):**
+```bash
+df -h                           # confirm which partition is full
+df -i                           # also check inodes — separate issue
+```
+
+> **Layer 2 — Find the offenders (< 5 minutes):**
+```bash
+find /var -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+du -sh /var/log/* | sort -rh | head -5   # quick directory drill-down
+```
+
+> **Layer 3 — Check for phantom held-open files:**
+```bash
+find /proc/*/fd -ls 2>/dev/null | grep "(deleted)"
+```
+
+> **Layer 4 — Immediate space recovery options (safest first):**
+```bash
+journalctl --vacuum-size=500M     # trim systemd journal
+apt-get clean                     # clear apt cache
+find /var/log -name "*.gz" -mtime +30 -delete  # old compressed logs
+> /var/log/bigfile.log            # truncate held-open log
+```
+
+> **Layer 5 — Prevent recurrence:**
+```bash
+logrotate -f /etc/logrotate.conf  # force rotation now
+# Add missing logrotate config for uncovered logs
+# Set up monitoring: alert at 80% before hitting 92%
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+FIND LARGEST FILES:
+  find /var -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+  du -ah /var | sort -rh | head -10          # includes dirs (noisier)
+  find /var -type f -printf "%s\t%p\n" | sort -rn | head -10  # bytes
+
+FIND OPEN FILE HANDLES:
+  # lsof (if available):
+  lsof +D /var/log/                          # all open files in dir
+  lsof /var/log/mysql-slow.log               # specific file
+
+  # /proc method (always works):
+  for pid in $(ls /proc|grep '^[0-9]'); do
+    for fd in /proc/$pid/fd/*; do
+      target=$(readlink $fd 2>/dev/null)
+      [[ "$target" == /var/* ]] && echo "$pid $target"
+    done
+  done
+
+FIND DELETED BUT HELD OPEN (phantom files):
+  find /proc/*/fd -ls 2>/dev/null | grep "(deleted)"
+  lsof | grep "(deleted)"           # if lsof available
+
+TRUNCATE SAFELY (process keeps writing):
+  > /var/log/bigfile.log
+  truncate -s 0 /var/log/bigfile.log
+
+CHECK LOGROTATE:
+  grep -rl "mysql-slow.log" /etc/logrotate.d/  # is it configured?
+  logrotate -d /etc/logrotate.d/nginx          # dry run
+  logrotate -vf /etc/logrotate.d/nginx         # force now, verbose
+  cat /var/lib/logrotate/status               # last rotation times
+
+QUICK SPACE RECOVERY:
+  journalctl --vacuum-size=500M    # trim journal
+  apt-get clean                    # clear apt cache  
+  docker system prune              # docker garbage
+  find /var/log -name "*.gz" -mtime +30 -delete  # old compressed logs
+
+SORT -RH EXPLAINED:
+  -r = reverse (highest first)
+  -h = human-readable (understands G > M > K)
+  Without -h: 891M sorts above 2.3G (wrong!)
+  With -rh:   2.3G sorts above 891M (correct!)
+```
+
+> **Google interview tip:** They'll push you to explain WHY each step matters, not just the commands. The "deleted but held open" phantom file concept is a classic gotcha they love — know it cold. Also mention monitoring: "I'd set up an alert at 80% so we're never firefighting at 92% again" — that proactive SRE mindset is exactly what Google wants to hear.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Real-Time Log Timestamping
+> **Company:** Adobe | **Difficulty:** Medium
+---
+#### **Scenario**
+You're troubleshooting a service that produces untagged log output when run manually, making it difficult to analyze timing and sequence of events.
+#### **Task**
+Create a command that reads from standard input line by line and appends the current timestamp to the end of each line as it's read. Test it interactively by piping output to verify it works, then save the solution to a shell script at `/usr/local/bin/timestamp.sh` and make it executable so it can be used in any pipeline.
+#### **Example**
+```
+# Before (untagged log output)
+Application started
+Processing request #1234
+Database connection established
+Request completed
+```
+```
+# After (timestamped in real-time)
+Application started - 2025-11-06 15:30:45
+Processing request #1234 - 2025-11-06 15:30:46
+Database connection established - 2025-11-06 15:30:47
+Request completed - 2025-11-06 15:30:48
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/real-time-log-timestamping)
+
+## Real-Time Log Timestamping — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Actually Solving?
+
+```
+Service runs and outputs logs with NO timestamps:
+  Application started
+  Processing request #1234         ← WHEN did this happen?
+  Database connection established  ← HOW LONG after the previous line?
+  Request completed                ← impossible to know
+
+We need a WRAPPER that adds time to each line AS IT ARRIVES:
+  command | timestamp.sh
+  Application started              - 2025-11-06 15:30:45
+  Processing request #1234         - 2025-11-06 15:30:46  ← 1 second later
+  Database connection established  - 2025-11-06 15:30:47  ← 1 second later
+  Request completed                - 2025-11-06 15:30:48  ← 1 second later
+```
+
+### The Core Challenge — What "Real-Time" Means
+
+```
+Wrong approach (one timestamp for ALL lines):
+  START_TIME=$(date)              ← captured ONCE at start
+  cat | while read line; do
+    echo "$line - $START_TIME"   ← every line gets same time ✗
+  done
+
+Right approach (fresh timestamp PER LINE):
+  while read line; do
+    echo "$line - $(date)"       ← date called EVERY iteration ✓
+  done
+  Each line gets the time IT arrives — true real-time ✓
+```
+
+### Three Methods — Ranked Best to Worst
+
+```
+Method 1: while read loop    ← most readable, truly per-line, portable
+Method 2: awk strftime       ← fastest (no subshell), good for high volume
+Method 3: ts (moreutils)     ← best tool but requires installation
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Understand `while IFS= read -r line`### Step 2 — Prove It's Truly Per-Line Real-Time`while read` correctly shows `:16`, `:17`, `:18` — one second each. `awk` batches them. **`while read` wins for real-time streaming.**
+
+### Step 3 — Create the Script### Step 4 — Test All Scenarios`First :00` → `Second :01` → `Third :02`. Script works exactly as required.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `while IFS= read -r line` — Every Component
+
+```
+while                    ← loop until condition fails
+  IFS=                   ← Internal Field Separator = EMPTY
+                            empty means: don't split on any whitespace
+                            result: leading/trailing spaces PRESERVED
+                            without: "  hello  " → "hello" (stripped)
+
+  read                   ← bash builtin: reads one line from stdin
+                           stops at newline or EOF
+                           sets exit code 1 at EOF → while loop ends
+
+       -r                ← raw mode: don't interpret backslashes
+                            without: \n = newline, \t = tab (destructive!)
+                            with:    \n stays as literal \n ✓
+
+          line           ← variable name to store the line read
+; do
+    echo "${line}..."    ← process the line
+done                     ← back to while → reads next line
+```
+
+### Why `$(date)` in a Loop is Correct Here
+
+```
+WRONG — timestamp captured once:
+  TS=$(date '+%Y-%m-%d %H:%M:%S')  ← evaluated ONCE before loop
+  while IFS= read -r line; do
+      echo "${line} - ${TS}"        ← all lines get same time
+  done
+
+CORRECT — timestamp evaluated per iteration:
+  while IFS= read -r line; do
+      echo "${line} - $(date '+%Y-%m-%d %H:%M:%S')"  ← fresh per line ✓
+  done
+
+$() in a loop = subshell spawned for EACH iteration
+Performance: ~1ms per call, fine for log rates up to ~1000 lines/sec
+For higher rates: use awk strftime (no subshell) with stdbuf -oL
+```
+
+### The Buffering Problem — Pipes and `stdbuf`
+
+```
+Pipeline:  command → pipe → timestamp.sh
+
+Two levels of buffering:
+  1. command's stdout buffer  → typically line-buffered in terminal
+                              → block-buffered (4KB) in pipe ← ISSUE
+  2. timestamp.sh's processing → line-by-line ✓
+
+Problem scenario:
+  Long-running service writes 10 lines/sec
+  Without unbuffering: lines accumulate in 4KB buffer
+  Appear in timestamp.sh in burst of ~50 lines at once
+  All with the same timestamp ← defeats real-time purpose
+
+Fix: stdbuf -oL forces line-buffering on command's stdout:
+  stdbuf -oL ./service.sh | timestamp.sh  ← truly per-line ✓
+
+Or: force unbuffered with -u0:
+  stdbuf -oL -eL ./service.sh | timestamp.sh
+```
+
+### The `date` Format Codes
+
+```
+%Y  → 4-digit year        (2026)
+%m  → 2-digit month       (05)
+%d  → 2-digit day         (21)
+%H  → hour 24h format     (18)
+%M  → minute              (16)
+%S  → second              (35)
+%N  → nanoseconds         (923847261)  ← for milliseconds: %.3N
+
+Common formats:
+  '%Y-%m-%d %H:%M:%S'     → 2026-05-21 18:16:35  (task format)
+  '%H:%M:%S'              → 18:16:35              (time only)
+  '%Y-%m-%dT%H:%M:%S%z'   → 2026-05-21T18:16:35+0000  (ISO 8601)
+  '%s'                    → 1747851395             (Unix epoch)
+  '%Y-%m-%d %H:%M:%S.%3N' → 2026-05-21 18:16:35.142  (milliseconds)
+```
+
+### The Final-Line Edge Case
+
+```
+Normal lines end with \n:
+  "Application started\n"  ← read consumes \n, stores "Application started"
+
+Final line WITHOUT \n (common in piped output):
+  "Request completed"  ← no newline at end
+  read: stores "Request completed", returns exit code 1 (EOF)
+  Loop exits BUT $line is NOT empty — still has the last line!
+
+Without edge case handling:
+  printf "line1\nline2" | while IFS= read -r line; do echo "$line - ts"; done
+  → "line1 - ts" only!  ← line2 silently dropped ✗
+
+With edge case handling:
+  done
+  [ -n "$line" ] && echo "${line} - $(date ...)"
+  → "line1 - ts"
+  → "line2 - ts" ← properly handled ✓
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "Explain `while IFS= read -r line`. What does each part do?"
+
+**Answer:**
+> *"`while` loops continuously reading from stdin until `read` returns non-zero (EOF). `IFS=` sets the Internal Field Separator to empty string — without this, `read` strips leading and trailing whitespace, which would corrupt log lines with intentional indentation. `-r` disables backslash interpretation — without it, `\n` in a log line becomes an actual newline, `\t` becomes a tab, destroying the original content. Together, `IFS= read -r` guarantees the line variable contains exactly what was written to stdin."*
+
+---
+
+### Q2. "Why is `$(date)` called inside the loop rather than before it?"
+
+**Answer:**
+> *"If you capture `TS=$(date)` before the loop, every line gets the same timestamp — the moment the script started. That defeats the entire purpose. By calling `$(date)` inside the loop, a fresh subprocess is spawned for every line read. Each line gets the actual wall-clock time at the moment that specific line arrived from stdin. It's slightly less efficient — one subshell per line — but for any reasonable log rate it's imperceptible, and for very high-throughput scenarios you'd switch to awk's built-in `strftime()` which has no subshell overhead."*
+
+---
+
+### Q3. "What is pipe buffering and how does it affect real-time timestamping?"
+
+**Answer:**
+> *"When a process writes to a pipe, the OS buffers that output — typically 4KB or 8KB blocks. The receiving process (timestamp.sh) doesn't see anything until the buffer fills or the sender flushes. This means a service writing slowly could produce 50 lines over 5 seconds, but timestamp.sh only sees them all at once when the buffer fills — all getting the same burst timestamp. The fix is `stdbuf -oL` on the upstream command, which forces line-buffered output so each newline flushes the buffer immediately. Alternatively, many programs accept `-u` or `--unbuffered` flags for the same effect."*
+
+```bash
+# Default (blocks):    lines batch up → all same timestamp
+./service.sh | timestamp.sh
+
+# Fix (line-buffered): each line flushed immediately
+stdbuf -oL ./service.sh | timestamp.sh
+```
+
+---
+
+### Q4. "Why `#!/bin/bash` and not `#!/bin/sh`?"
+
+**Answer:**
+> *"`/bin/sh` is the POSIX shell — it may be `dash`, `ash`, or another minimal shell that doesn't support all bash features. Our script uses `${var:-default}` for optional env variables which is POSIX-compatible, but the general rule is: if you write `bash` features, declare bash. Also, `while IFS= read -r` behavior can vary slightly between shell implementations — bash's behavior is consistent and well-documented. At Adobe's scale where scripts run across many different systems, being explicit about the interpreter prevents subtle breakage from different `sh` implementations."*
+
+---
+
+### Q5. "How would you add millisecond precision to the timestamps?"
+
+**Answer:**
+```bash
+# GNU date — milliseconds with %3N (first 3 digits of nanoseconds)
+echo "event" | while IFS= read -r line; do
+    echo "${line} - $(date '+%Y-%m-%d %H:%M:%S.%3N')"
+done
+# Output: event - 2026-05-21 18:16:35.142
+
+# awk with gensub for ms — requires gawk
+echo "event" | awk '{
+    cmd = "date +%s%3N"
+    cmd | getline ms
+    close(cmd)
+    printf "%s - %s.%s\n", $0, substr(ms,1,10), substr(ms,11,3)
+    fflush()
+}'
+
+# Python (most accurate):
+echo "event" | python3 -c "
+import sys, datetime
+for line in sys.stdin:
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    print(line.rstrip() + ' - ' + ts)
+    sys.stdout.flush()
+"
+```
+
+---
+
+### Q6. "How would you make `timestamp.sh` support both appending and prepending the timestamp?"
+
+**Answer:**
+```bash
+#!/bin/bash
+# Enhanced with mode selection
+MODE="${TIMESTAMP_MODE:-append}"    # "append" or "prepend"
+FORMAT="${TIMESTAMP_FORMAT:-%Y-%m-%d %H:%M:%S}"
+SEP="${SEPARATOR:- - }"
+
+while IFS= read -r line; do
+    TS=$(date "+$FORMAT")
+    case "$MODE" in
+        prepend)  echo "${TS}${SEP}${line}" ;;
+        append)   echo "${line}${SEP}${TS}"  ;;
+        *)        echo "${line}${SEP}${TS}"  ;;
+    esac
+done
+[ -n "$line" ] && {
+    TS=$(date "+$FORMAT")
+    case "$MODE" in
+        prepend) echo "${TS}${SEP}${line}" ;;
+        *)       echo "${line}${SEP}${TS}" ;;
+    esac
+}
+```
+
+```bash
+# Usage:
+./service.sh | timestamp.sh                         # append (default)
+TIMESTAMP_MODE=prepend ./service.sh | timestamp.sh  # prepend
+```
+
+---
+
+### Q7. "What's the difference between `echo` and `printf` for output in this script?"
+
+**Answer:**
+> *"`echo` appends a newline automatically and is simpler. But it has a portability issue: `echo -e` expands escape sequences in some shells but not others, and `echo` with strings starting with `-` can be misinterpreted as flags. `printf` is fully portable and predictable — `printf '%s\n' "$line - $ts"` always works correctly regardless of the content of `$line`. For this script, `echo` is fine because we control what we're outputting and we want the newline. But in a hardened production script, `printf '%s\n' "${line}${SEPARATOR}${TS}"` is the safer choice."*
+
+---
+
+### Q8. "How would you use `timestamp.sh` in a systemd service to add timestamps to all output?"
+
+**Answer:**
+```ini
+# /etc/systemd/system/myapp.service
+[Unit]
+Description=My Application
+
+[Service]
+Type=simple
+# Pipe all stdout through timestamp.sh before journald
+ExecStart=/bin/bash -c '/usr/local/bin/myapp 2>&1 | /usr/local/bin/timestamp.sh'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> *"But actually, for systemd services the better answer is that journald already adds timestamps automatically — every journal entry has a precise timestamp. `timestamp.sh` is most valuable for: ad-hoc debugging sessions where you pipe a service's output to a file, legacy services that write to flat files without systemd, CI/CD pipelines where you want timestamped build logs, or any context where you're capturing stdout to a log file without a logging framework."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+THE CORE SCRIPT:
+  while IFS= read -r line; do
+      echo "${line} - $(date '+%Y-%m-%d %H:%M:%S')"
+  done
+  [ -n "$line" ] && echo "${line} - $(date '+%Y-%m-%d %H:%M:%S')"
+
+KEY FLAGS:
+  IFS=      → don't strip whitespace from line edges
+  read -r   → don't interpret \n \t as special chars
+  done → [ -n "$line" ] → handle final line without newline
+
+DATE FORMAT CODES:
+  %Y-%m-%d  → 2026-05-21
+  %H:%M:%S  → 18:16:35
+  %3N       → 142 (milliseconds, GNU date only)
+  %s        → 1747851395 (Unix epoch)
+  %z        → +0000 (timezone offset)
+
+USAGE PATTERNS:
+  command | timestamp.sh                          # basic
+  command | timestamp.sh | tee service.log        # display + save
+  command | timestamp.sh >> /var/log/out.log      # append to log
+  stdbuf -oL command | timestamp.sh              # force line buffering
+  TIMESTAMP_FORMAT="%H:%M:%S" command | timestamp.sh  # custom format
+
+AWK ALTERNATIVE (faster for high volume):
+  command | stdbuf -oL awk '{
+      print $0 " - " strftime("%Y-%m-%d %H:%M:%S"); fflush()
+  }'
+
+WHILE READ vs AWK:
+  while read → truly per-line, no buffering surprise, readable
+  awk strftime → faster (no subshell), but needs stdbuf -oL in pipes
+  ts (moreutils) → best tool, but requires apt install moreutils
+
+PERMISSION CHECK:
+  chmod +x /usr/local/bin/timestamp.sh   # make executable
+  ls -lh /usr/local/bin/timestamp.sh    # verify -rwxr-xr-x
+```
+
+> **Adobe interview tip:** They care about **creative pipeline thinking** and **developer tools**. Show you understand the full context — when does a service NOT have timestamps (docker logs, debug sessions, CI pipelines) and how `timestamp.sh` fits into a broader observability strategy. Mention `ts` from moreutils as the production-grade tool, but know the `while read` implementation cold — that's what they're testing here. Extra points for mentioning the buffering problem and `stdbuf -oL`.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+# Recursive Database File Backup
+> **Company:** GitLab | **Difficulty:** Easy
+---
+#### **Scenario**
+Before performing a system-wide database schema migration, you've been asked to ensure that all existing `.db` files are safely backed up. These files may be scattered across multiple subdirectories, and simply renaming them isn't enough. You must create backup copies with the `.db.bak` extension, preserving directory structure and permissions.
+#### **Task**
+Recursively scan a given directory (`/opt/data/`) and create backup copies of all files ending with `.db`. Each backup should have the same name but with the `.bak` suffix added (e.g., `app.db` → `app.db.bak`) and remain in the same directory as the original file, ensuring the originals are left untouched.
+#### **Example**
+```
+# Before (only original .db files exist)
+/opt/data/apps/inventory.db
+/opt/data/logs/session.db
+/opt/data/config/settings.db
+```
+```
+# After (backup copies created alongside originals)
+/opt/data/apps/inventory.db
+/opt/data/apps/inventory.db.bak
+/opt/data/logs/session.db
+/opt/data/logs/session.db.bak
+/opt/data/config/settings.db
+/opt/data/config/settings.db.bak
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/recursive-database-file-backup)
+
+
+## Recursive Database File Backup — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Doing and Why?
+
+```
+Before schema migration (dangerous operation):
+  /opt/data/apps/inventory.db    ← original (at risk)
+  /opt/data/logs/session.db      ← original (at risk)
+  /opt/data/config/settings.db   ← original (at risk)
+
+After backup (safe to migrate):
+  /opt/data/apps/inventory.db        ← original (untouched)
+  /opt/data/apps/inventory.db.bak    ← backup copy (safe)
+  /opt/data/logs/session.db          ← original (untouched)
+  /opt/data/logs/session.db.bak      ← backup copy (safe)
+  /opt/data/config/settings.db       ← original (untouched)
+  /opt/data/config/settings.db.bak   ← backup copy (safe)
+
+Rules:
+  ✓ Same directory as original
+  ✓ Same permissions as original  (cp -p preserves this)
+  ✓ Original untouched            (cp, not mv)
+  ✓ Recursive                     (find scans all subdirs)
+  ✗ Don't backup .bak files       (avoid double-backing up)
+```
+
+### The Core Tool: `cp` vs `mv` vs `ln`
+
+```
+cp original original.bak   ← COPY — two files, both intact ✓
+mv original original.bak   ← MOVE — renames, original GONE ✗
+ln original original.bak   ← HARDLINK — shared data, risky ✗
+
+We need cp — always creates an independent copy
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Test Environment### Step 2 — Understand the Pipeline Stage by Stage### Step 3 — Three Methods (All Correct, Best to Know All)### Step 4 — Verify EverythingAll 5 `.db` files backed up. Permissions identical. Originals untouched. Non-`.db` files ignored.
+
+---
+
+### Step 5 — Production-Grade Script Version---
+
+## Part 3: Every Concept Explained Simply
+
+### `find` Flags — What Each One Does
+
+```bash
+find /opt/data -name "*.db" -type f
+
+find          → the command
+/opt/data     → WHERE to start searching (recursive by default)
+-name "*.db"  → match filenames ending in .db
+                * = any characters
+                .db must be at the END of filename
+                  inventory.db  ✓
+                  session.db    ✓
+                  settings.conf ✗ (doesn't end in .db)
+                  app.db.bak    ✗ (doesn't end in .db)  ← important!
+
+-type f       → only regular files (not directories)
+                if someone made a dir called "data.db/"
+                -type f excludes it — we only backup actual files
+```
+
+### `cp -p` — Preserve Flag Breakdown
+
+```bash
+cp -p source destination
+
+-p preserves:
+  Mode        (permissions: -rw-r-----)
+  Ownership   (user:group)
+  Timestamps  (mtime, atime)
+
+Without -p:
+  inventory.db  →  permissions: -rw-r-----  (640)
+  inventory.db.bak → permissions: -rw-r--r-- (644) ← umask applied, DIFFERENT
+
+With -p:
+  inventory.db  →  permissions: -rw-r-----  (640)
+  inventory.db.bak → permissions: -rw-r----- (640) ← IDENTICAL ✓
+
+Why permissions matter for database backups:
+  DB file: -rw------- (600) only owner can read
+  Without -p: backup is -rw-r--r-- (644) — world readable!
+  Potential security issue — sensitive data exposed
+```
+
+### `"${f}.bak"` — Variable Expansion and Why Quotes Matter
+
+```bash
+f="/opt/data/apps/inventory.db"
+
+"${f}.bak"
+  ${f}  → /opt/data/apps/inventory.db
+  .bak  → literal string appended
+  =     → /opt/data/apps/inventory.db.bak  ✓
+
+Why double quotes?
+  f="/opt/data/my databases/app.db"  ← space in path!
+  Without quotes: cp -p /opt/data/my databases/app.db ...
+                  bash splits on space → BROKEN
+  With quotes:    cp -p "/opt/data/my databases/app.db" "..."
+                  path treated as one argument → WORKS ✓
+
+Rule: ALWAYS quote variables in shell scripts.
+```
+
+### `! -name "*.db.bak"` — Preventing Re-backup
+
+```
+If you run the script TWICE without this filter:
+
+First run:
+  inventory.db → inventory.db.bak         ✓
+
+Second run (without filter):
+  inventory.db → inventory.db.bak         (overwrites, fine)
+  inventory.db.bak → inventory.db.bak.bak ← UNWANTED!
+  
+Third run:
+  inventory.db.bak.bak → inventory.db.bak.bak.bak ← cascade!
+
+Fix: exclude .db.bak from find results
+  find /opt/data -type f -name "*.db" ! -name "*.db.bak"
+  Now: inventory.db.bak doesn't match *.db pattern at all ✓
+  (*.db matches files ending in .db — .db.bak ends in .bak)
+```
+
+### `< <(find ...)` — Process Substitution vs Pipe
+
+```bash
+# Pipe version (common but has a subtle issue):
+find /opt/data -name "*.db" | while read f; do
+    SUCCESS=$((SUCCESS + 1))  # ← runs in SUBSHELL
+done
+echo "$SUCCESS"  # ← prints 0! variable not visible outside pipe
+
+# Process substitution (correct):
+while read f; do
+    SUCCESS=$((SUCCESS + 1))  # ← runs in CURRENT shell
+done < <(find /opt/data -name "*.db")
+echo "$SUCCESS"  # ← prints 5 ✓
+
+Why: pipe creates a subshell for each side
+     < <(...) redirects find output INTO current shell's while loop
+     Variables set in the loop are visible after it ✓
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "Walk me through the command to recursively backup all .db files."
+
+**Answer:**
+```bash
+find /opt/data -type f -name "*.db" ! -name "*.db.bak" | \
+    while IFS= read -r f; do
+        cp -p "$f" "${f}.bak"
+    done
+```
+
+> *"`find` recursively walks `/opt/data` and outputs every regular file ending in `.db`. `! -name '*.db.bak'` prevents already-backed-up files from being re-processed. The `while IFS= read -r` loop reads each path safely — `IFS=` preserves spaces in paths, `-r` prevents backslash interpretation. `cp -p` creates the backup in the same directory by appending `.bak` to the full path, with `-p` preserving the original file's permissions and timestamps."*
+
+---
+
+### Q2. "Why use `cp -p` instead of just `cp`?"
+
+**Answer:**
+> *"`-p` preserves three things: file mode (permissions), ownership, and timestamps. For database files specifically, permissions often restrict access — a file with `600` is owner-only readable. Without `-p`, the backup would inherit the umask permissions (typically `644`), making sensitive database contents world-readable. Preserving timestamps also matters for auditing — you can verify the backup was made from the pre-migration file, not a post-migration copy. In a GitLab context where you're handling potentially sensitive data, `-p` is non-negotiable."*
+
+---
+
+### Q3. "What's the difference between `-name '*.db'` and `-name '*.db.bak'` matching? Would `*.db` match `app.db.bak`?"
+
+**Answer:**
+> *"No — `*.db` matches files whose name ends exactly in `.db`. `app.db.bak` ends in `.bak`, not `.db`, so it doesn't match. This is actually a useful safety property — it means we don't need an explicit exclusion of `.db.bak` files from a pure `find` perspective. However, I add `! -name '*.db.bak'` anyway as defensive programming — it makes the intent explicit and protects against edge cases where someone might create a file named `app.db.bak.db`."*
+
+---
+
+### Q4. "Why `IFS= read -r` instead of just `read`?"
+
+**Answer:**
+> *"Two protections. `IFS=` prevents `read` from stripping leading and trailing whitespace from the line — relevant if a database file is in a path like `/opt/data/my app/data.db` where path components could have spaces. `-r` disables backslash interpretation — without it, a filename like `backup\data.db` would have `\d` interpreted as a literal `d`, corrupting the path. Together they guarantee the variable receives exactly the path that `find` output, character for character."*
+
+---
+
+### Q5. "What's the risk of using a pipe to while vs process substitution? When does it matter?"
+
+**Answer:**
+> *"Piping to `while` runs the loop body in a subshell in bash — any variables set inside the loop, like counters for success/failure, are invisible to the parent shell after the loop ends. Process substitution `< <(find ...)` redirects find's output into the current shell's while loop, so counters and state changes persist. For a simple backup one-liner this doesn't matter. For a production script that counts successes and failures and exits with the right code — it matters a lot."*
+
+```bash
+# Pipe — counter lost:
+count=0
+find . -name "*.db" | while read f; do count=$((count+1)); done
+echo $count  # 0 — lost in subshell
+
+# Process substitution — counter preserved:
+count=0
+while read f; do count=$((count+1)); done < <(find . -name "*.db")
+echo $count  # 5 ✓
+```
+
+---
+
+### Q6. "How would you verify the backups are identical to the originals?"
+
+**Answer:**
+```bash
+# MD5 checksum comparison
+find /opt/data -name "*.db" ! -name "*.db.bak" | while IFS= read -r f; do
+    orig=$(md5sum "$f" | awk '{print $1}')
+    bak=$(md5sum "${f}.bak" 2>/dev/null | awk '{print $1}')
+    if [ "$orig" = "$bak" ]; then
+        echo "✓ OK: $f"
+    else
+        echo "✗ MISMATCH or MISSING: $f"
+    fi
+done
+
+# Alternative: diff (for text files)
+diff "$f" "${f}.bak" && echo "identical" || echo "different"
+
+# For binary files: cmp is faster than diff
+cmp -s "$f" "${f}.bak" && echo "identical" || echo "different"
+```
+
+---
+
+### Q7. "How would you make the backup idempotent — safe to run multiple times?"
+
+**Answer:**
+> *"Two approaches: skip if backup already exists and is newer than the original, or always overwrite (idempotent by definition). For a pre-migration backup, I prefer the 'skip if newer' approach — it protects against accidentally overwriting a backup made after the migration with a corrupted post-migration copy:"*
+
+```bash
+find /opt/data -type f -name "*.db" ! -name "*.db.bak" | while IFS= read -r f; do
+    BAK="${f}.bak"
+    # Skip if backup exists AND is newer than original
+    if [ -f "$BAK" ] && [ "$BAK" -nt "$f" ]; then
+        echo "SKIP (up-to-date): $BAK"
+        continue
+    fi
+    cp -p "$f" "$BAK" && echo "OK: $f" || echo "FAIL: $f" >&2
+done
+```
+
+---
+
+### Q8. "How would you restore from backup if the migration goes wrong?"
+
+**Answer:**
+```bash
+# Restore all .bak files to original names
+find /opt/data -name "*.db.bak" -type f | while IFS= read -r bak; do
+    original="${bak%.bak}"    # strip .bak suffix
+    echo "Restoring: $bak → $original"
+    cp -p "$bak" "$original"
+done
+
+# Or with mv (faster, no copy — destructive if restore fails midway):
+find /opt/data -name "*.db.bak" -type f -exec sh -c \
+    'mv "$1" "${1%.bak}"' _ {} \;
+
+# Verify restore:
+find /opt/data -name "*.db" ! -name "*.db.bak" | while IFS= read -r f; do
+    md5sum "$f"
+done
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE ONE-LINER:
+  find /opt/data -type f -name "*.db" ! -name "*.db.bak" | \
+      while IFS= read -r f; do cp -p "$f" "${f}.bak"; done
+
+THREE METHODS:
+  # 1. while read (most readable)
+  find /opt/data -type f -name "*.db" | while IFS= read -r f; do
+      cp -p "$f" "${f}.bak"
+  done
+
+  # 2. find -exec (no subshell)
+  find /opt/data -type f -name "*.db" \
+      -exec sh -c 'cp -p "$1" "$1.bak"' _ {} \;
+
+  # 3. xargs (parallelizable with -P)
+  find /opt/data -type f -name "*.db" -print0 | \
+      xargs -0 -I{} cp -p {} {}.bak
+
+KEY FLAGS:
+  find -type f      → files only (not directories)
+  find -name "*.db" → exact suffix match
+  find ! -name "*.db.bak" → exclude already-backed-up files
+  cp -p             → preserve permissions, ownership, timestamps
+  IFS= read -r      → safe path reading (spaces + backslashes)
+  "${f}.bak"        → append .bak — keeps file in same dir ✓
+
+VERIFY BACKUP:
+  md5sum "$f" "${f}.bak"          # checksum compare
+  cmp -s "$f" "${f}.bak"          # binary compare (silent)
+  diff "$f" "${f}.bak"            # diff (text files)
+
+RESTORE:
+  find /opt/data -name "*.db.bak" | while IFS= read -r b; do
+      cp -p "$b" "${b%.bak}"
+  done
+  # ${b%.bak} strips the .bak suffix → original filename
+
+DOES *.db MATCH app.db.bak?
+  NO — *.db matches files ending in .db
+  app.db.bak ends in .bak → excluded automatically ✓
+```
+
+> **GitLab interview tip:** They care deeply about **idempotency** (safe to run multiple times) and **data integrity** — always mention MD5 verification after backup and the restore procedure. GitLab runs CI/CD pipelines where scripts may be re-triggered, so showing you think about "what if this runs twice?" puts you ahead. Mentioning `cp -p` for permission preservation specifically — not just `cp` — shows production awareness they value highly.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+# Recursive Keyword Finder
+> **Company:** X | **Difficulty:** Easy
+---
+#### **Scenario**
+Multiple applications write logs under `/var/log`, and you need to quickly check if any recent errors have been recorded.
+#### **Task**
+Search recursively under `/var/log` for all files ending with `.log`, print every line that contains the text `ERROR`, ensure the output includes both the filename and the matching line, and save the results to `/home/devops/error_logs.txt`.
+#### **Example**
+```
+# Before (multiple log files scattered across directories)
+/var/log/apache2/error.log
+/var/log/apache2/access.log
+/var/log/application.log
+/var/log/mysql/error.log
+/var/log/syslog
+```
+```
+# After (ERROR lines found and saved to /home/devops/error_logs.txt)
+/var/log/apache2/error.log:ERROR: Connection timeout to database server
+/var/log/application.log:ERROR: Unable to write to cache directory
+/var/log/mysql/error.log:ERROR: InnoDB: Cannot allocate memory for buffer pool
+/var/log/syslog:ERROR: Disk quota exceeded for user appuser
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/recursive-keyword-finder)
+
+
+
+## Recursive Keyword Finder — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What `grep` Does Under the Hood
+
+```
+grep  =  Global Regular Expression Print
+
+Opens each file → reads line by line →
+tests each line against pattern →
+prints matching lines WITH filename prefix
+
+Without -r:  grep "ERROR" /var/log/app.log
+             → searches ONE file only
+
+With -r:     grep -r "ERROR" /var/log/
+             → walks entire directory tree, opens EVERY file
+             → searches thousands of files with one command
+```
+
+### What the Output Looks Like
+
+```
+grep -r --include="*.log" "ERROR" /var/log/
+
+Format: FILENAME:MATCHING_LINE
+         ↑         ↑
+         always    the full line that matched
+         included
+         when
+         multiple
+         files
+
+/var/log/apache2/error.log:ERROR: Connection timeout
+/var/log/mysql/error.log:ERROR: InnoDB: Cannot allocate memory
+/var/log/application.log:ERROR: Unable to write to cache
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create Realistic Log Environment### Step 2 — Explain Each Flag Before Running### Step 3 — Run the Core Command### Step 4 — Save to File and Verify### Step 5 — Show What Changes With Different Flags---
+
+## Part 3: Every Concept Explained Simply
+
+### How `grep -r` Actually Walks Directories
+
+```
+grep -r --include="*.log" "ERROR" /var/log/
+
+  Step 1: open /var/log/
+  Step 2: for each entry:
+    Is it a file AND name matches *.log?
+      → open it, search for "ERROR"
+    Is it a directory?
+      → recurse into it (same process)
+    Is it a file but doesn't match *.log?
+      → SKIP (--include filter)
+
+  /var/log/
+  ├── syslog.log        ← ✓ matches *.log → search
+  ├── apache2/
+  │   ├── error.log     ← ✓ matches *.log → search
+  │   ├── access.log    ← ✓ matches *.log → search
+  │   └── error.txt     ← ✗ doesn't match *.log → SKIP
+  └── mysql/
+      └── error.log     ← ✓ matches *.log → search
+```
+
+### `--include` vs `-name` — Key Difference
+
+```bash
+# grep --include filters by FILENAME only
+grep -r --include="*.log" "ERROR" /var/log/
+# *.log matches the filename component only
+# error.log ✓     access.log ✓     syslog ✗
+
+# find -name also matches FILENAME only
+find /var/log -name "*.log" -type f
+# Same matching rule
+
+# Common confusion: --include="*.log" does NOT match
+# /var/log/app/data.log.1 → ends in .1, not .log ✓ correctly excluded
+# /var/log/syslog        → no .log extension ✓ correctly excluded
+```
+
+### The Filename:Line Output Format
+
+```
+grep output with multiple files:
+  filename:matching_line
+
+/var/log/apache2/error.log:ERROR: Connection timeout
+├──────────────────────────┤├──────────────────────┤
+     absolute path              matched line content
+        (from grep)             (verbatim from file)
+```
+
+Why does grep show filename automatically?
+
+```bash
+# Searching ONE file — no filename prefix:
+grep "ERROR" /var/log/apache2/error.log
+→ ERROR: Connection timeout   ← no filename (obvious which file)
+
+# Searching MULTIPLE files — filename prefix added:
+grep "ERROR" /var/log/apache2/error.log /var/log/mysql/error.log
+→ /var/log/apache2/error.log:ERROR: Connection timeout
+  /var/log/mysql/error.log:ERROR: InnoDB: Cannot allocate memory
+
+# Force filename ALWAYS (even for 1 file):
+grep -H "ERROR" /var/log/apache2/error.log
+→ /var/log/apache2/error.log:ERROR: Connection timeout
+
+# Suppress filename (even for multiple files):
+grep -h "ERROR" /var/log/apache2/error.log /var/log/mysql/error.log
+→ ERROR: Connection timeout
+→ ERROR: InnoDB: Cannot allocate memory
+```
+
+### `>` vs `>>` — Writing to Output File
+
+```bash
+grep -r --include="*.log" "ERROR" /var/log/ > /home/devops/error_logs.txt
+                                             ↑
+                                   OVERWRITE — creates fresh file each run
+                                   (correct for this task)
+
+grep -r --include="*.log" "ERROR" /var/log/ >> /home/devops/error_logs.txt
+                                             ↑↑
+                                   APPEND — adds to existing file
+                                   (use for incremental log collection)
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "What is the command to search all `.log` files recursively for `ERROR`?"
+
+**Answer:**
+```bash
+grep -r --include="*.log" "ERROR" /var/log/ > /home/devops/error_logs.txt
+```
+
+> *"`-r` makes grep search recursively through all subdirectories. `--include='*.log'` filters to only files ending in `.log` — without it, grep would attempt to search binary files and configs which produces noise and is slower. `'ERROR'` is the pattern — case-sensitive by default. The filename is automatically prepended to every matching line when multiple files are searched, giving the `filename:line` format the task requires. `>` saves results to the file."*
+
+---
+
+### Q2. "What does `--include` do and what happens without it?"
+
+**Answer:**
+> *"`--include='*.log'` tells grep to only open files whose name matches the glob pattern — files ending in `.log`. Without it, grep opens every single file under `/var/log` regardless of type — binary files like `btmp`, `faillog`, `wtmp`, compressed `.xz` files, `.conf` files, everything. This produces garbage output from binary files, potentially crashes on very large files, and is significantly slower. The `--include` filter is essential for targeted log searches."*
+
+---
+
+### Q3. "How does grep know to show the filename in the output?"
+
+**Answer:**
+> *"grep shows the filename prefix whenever it searches more than one file — it needs to tell you which file each match came from. With `-r`, grep is effectively searching many files simultaneously, so every match gets `filename:` prepended. You can override this with `-H` to always force the filename (even for single files) or `-h` to suppress it entirely. For saving to a report file, the default behavior is exactly right."*
+
+---
+
+### Q4. "How is `grep -r --include='*.log'` different from `find | xargs grep`?"
+
+**Answer:**
+> *"Both achieve the same result but grep's native `-r --include` is simpler and safer. The `find | xargs grep` pattern has a subtle bug with filenames containing spaces — `xargs` word-splits the paths, so a file named `my app.log` becomes two arguments: `my` and `app.log`. You need `find -print0 | xargs -0 grep` to handle this safely. `grep -r` handles all filenames correctly natively. The find approach is useful when you need more complex filtering — by modification time, size, owner — that `--include` can't express."*
+
+```bash
+# Risky (space in filename breaks it):
+find /var/log -name "*.log" | xargs grep "ERROR"
+
+# Safe:
+find /var/log -name "*.log" -print0 | xargs -0 grep -H "ERROR"
+
+# Best (simplest, handles everything):
+grep -r --include="*.log" "ERROR" /var/log/
+```
+
+---
+
+### Q5. "How would you search case-insensitively? When would you use it?"
+
+**Answer:**
+> *"Add `-i` flag. Without it, `ERROR` only matches `ERROR` — not `error`, `Error`, or `Error`. In practice different applications use different conventions: Java apps write `ERROR`, Python writes `error`, syslog uses `error`. For incident investigation where you want to catch ALL error indicators regardless of case, `-i` is safer. For this task, the requirement says `ERROR` specifically, so case-sensitive is correct — you only want lines explicitly tagged as ERROR by the application."*
+
+```bash
+grep -ri --include="*.log" "ERROR" /var/log/   # catches ERROR, error, Error
+grep -r  --include="*.log" "ERROR" /var/log/   # only ERROR (task requirement)
+```
+
+---
+
+### Q6. "How would you show lines around each match — context before and after?"
+
+**Answer:**
+> *"grep's `-A`, `-B`, and `-C` flags show context lines around each match. This is critical for incident investigation — an `ERROR` line alone rarely tells you why it happened, but the lines before it show the sequence of events leading up to it."*
+
+```bash
+grep -r --include="*.log" -A 2 "ERROR" /var/log/   # 2 lines After
+grep -r --include="*.log" -B 3 "ERROR" /var/log/   # 3 lines Before
+grep -r --include="*.log" -C 2 "ERROR" /var/log/   # 2 lines Context (both)
+
+# Example output with -C 2:
+# /var/log/apache2/error.log-INFO: Retrying connection attempt 1/3   ← before
+# /var/log/apache2/error.log:ERROR: Max retries exceeded             ← match
+# /var/log/apache2/error.log-INFO: Service entering degraded mode    ← after
+```
+
+---
+
+### Q7. "How would you count errors per log file and sort by most errors?"
+
+**Answer:**
+```bash
+# Count errors per file, sorted descending:
+grep -rc --include="*.log" "ERROR" /var/log/ \
+  | grep -v ":0" \
+  | sort -t: -k2 -rn
+
+# Output:
+# /var/log/apache2/error.log:2
+# /var/log/mysql/error.log:2
+# /var/log/app/service/application.log:2
+# /var/log/syslog.log:1
+```
+
+> *"`-c` outputs `filename:count` for every file, including zeros. `grep -v ':0'` removes files with no matches. `sort -t: -k2 -rn` sorts by the second colon-delimited field (the count) numerically in reverse. This gives you an instant health dashboard — which service is generating the most errors."*
+
+---
+
+### Q8. "How would you make this a live monitoring command — watching for new errors in real time?"
+
+**Answer:**
+> *"For real-time monitoring across multiple log files, `tail -f` with multiple files or `multitail` is the approach. For grep-based alerting, wrap in a loop or use `inotifywait`:"*
+
+```bash
+# Watch a single log for new ERRORs:
+tail -f /var/log/app/service/application.log | grep "ERROR"
+
+# Watch multiple files simultaneously:
+tail -f /var/log/apache2/error.log /var/log/mysql/error.log | grep "ERROR"
+
+# Periodic scan — run every 60 seconds:
+watch -n 60 "grep -rc --include='*.log' 'ERROR' /var/log/ | grep -v ':0'"
+
+# Alert via inotifywait (event-driven, no polling):
+inotifywait -m -r -e modify /var/log/ --include '.*\.log' |
+  while read dir event file; do
+    NEW_ERRORS=$(grep "ERROR" "${dir}${file}" | tail -5)
+    [ -n "$NEW_ERRORS" ] && echo "NEW ERRORS in ${dir}${file}: $NEW_ERRORS"
+  done
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE COMMAND:
+  grep -r --include="*.log" "ERROR" /var/log/ > /home/devops/error_logs.txt
+
+KEY FLAGS:
+  -r          → recursive (walk all subdirectories)
+  --include   → filter by filename pattern
+  -i          → case-insensitive (ERROR, error, Error)
+  -n          → show line numbers (file:linenum:match)
+  -l          → filenames only (no matching lines)
+  -h          → suppress filenames (lines only)
+  -H          → always show filenames (even 1 file)
+  -c          → count matches per file
+  -w          → whole word match only
+  -v          → invert (lines NOT matching)
+  -A N        → N lines After each match
+  -B N        → N lines Before each match
+  -C N        → N lines Context (before + after)
+
+OUTPUT FORMAT:
+  Default (multi-file): /path/to/file.log:matching line content
+  -n added:             /path/to/file.log:42:matching line content
+  -l only:              /path/to/file.log
+
+SAVE vs APPEND:
+  >  = overwrite (fresh file each run)
+  >> = append    (add to existing file)
+
+ALTERNATIVES:
+  find /var/log -name "*.log" -print0 | xargs -0 grep -H "ERROR"
+  find /var/log -name "*.log" -exec grep -H "ERROR" {} +
+
+COUNT ERRORS PER FILE:
+  grep -rc --include="*.log" "ERROR" /var/log/ | grep -v ":0" | sort -t: -k2 -rn
+
+WHICH FILES HAVE ERRORS:
+  grep -rl --include="*.log" "ERROR" /var/log/
+
+LIVE MONITORING:
+  tail -f /var/log/app.log | grep "ERROR"
+  watch -n 30 'grep -rc --include="*.log" "ERROR" /var/log/ | grep -v ":0"'
+```
+
+> **X (Twitter) interview tip:** At X's scale with millions of log lines per second, they'll ask about performance — mention `ripgrep` (`rg`) as the production-grade grep alternative that's 10–100x faster due to SIMD and automatic parallelism: `rg -t log "ERROR" /var/log/`. Also mention that for structured logs (JSON), tools like `jq` or `grep` + `jq` combination are more reliable than text grep because log field positions are stable. Shows you think beyond the basics.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Sorted Log Aggregation
+> **Company:** Airbnb | **Difficulty:** Easy
+---
+#### **Scenario**
+You have a log file `/tmp/app_combined.log` with entries from multiple servers in mixed order. Each line contains: timestamp, hostname, and action.
+#### **Task**
+Sort `/tmp/app_combined.log` by timestamp (earliest first), then by hostname for identical timestamps. Save the output to `/tmp/app_sorted.log`.
+#### **Example**
+```
+# Before (mixed order)
+2025-12-18 14:23:45 api02 POST /users/create
+2025-12-18 14:22:10 cache01 CACHE_MISS key=session_abc
+2025-12-18 14:22:55 api01 GET /products/list
+2025-12-18 14:22:10 db02 INSERT INTO orders VALUES
+2025-12-18 14:24:12 cache01 CACHE_SET key=user_profile
+```
+```
+# After (sorted by timestamp, then hostname)
+2025-12-18 14:22:10 cache01 CACHE_MISS key=session_abc
+2025-12-18 14:22:10 db02 INSERT INTO orders VALUES
+2025-12-18 14:22:55 api01 GET /products/list
+2025-12-18 14:23:45 api02 POST /users/create
+2025-12-18 14:24:12 cache01 CACHE_SET key=user_profile
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/sorted-log-aggregation)
+
+
+## Sorted Log Aggregation — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### Why Sort Logs at All?
+
+```
+Multiple servers write to a shared log simultaneously.
+Each server writes its own events — order is unpredictable:
+
+api02   writes at 14:23:45  ─┐
+cache01 writes at 14:22:10  ─┤─→ /tmp/app_combined.log
+api01   writes at 14:22:55  ─┤   (arrival order, not time order)
+db02    writes at 14:22:10  ─┘
+
+To debug: "what happened at 14:22:10?"
+  Unsorted → you have to scan entire file manually
+  Sorted   → all 14:22:10 events are together, in server order
+```
+
+### The Log Line Structure
+
+```
+2025-12-18 14:22:10 cache01 CACHE_MISS key=session_abc
+├──────────┤├───────┤├──────┤├────────────────────────┤
+  field 1    field 2  field 3  field 4+
+  date       time     hostname  action (rest of line)
+
+sort sees fields separated by WHITESPACE (default)
+  $1 = 2025-12-18   (date)
+  $2 = 14:22:10     (time)
+  $3 = cache01      (hostname)
+  $4+= rest of line
+
+Sort key: field 1+2 (timestamp), then field 3 (hostname)
+```
+
+### The Two-Level Sort Logic
+
+```
+Primary key:   timestamp = fields 1 AND 2
+               date (2025-12-18) + time (14:22:10)
+               together they form the full timestamp
+
+Secondary key: hostname = field 3
+               only used when timestamps are IDENTICAL
+               tie-breaker: cache01 before db02 alphabetically
+
+Result:
+  14:22:10 cache01  ← same time, cache01 < db02 alphabetically
+  14:22:10 db02
+  14:22:55 api01    ← different time
+  14:23:45 api02
+  14:24:12 cache01
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Input File### Step 2 — Understand the `sort` Command Stage by Stage### Step 3 — Run the Final Command### Step 4 — Before vs After Side by Side### Step 5 — Common Variations---
+
+## Part 3: Every Concept Explained Simply
+
+### `sort -k` — The Key Specification Fully Decoded
+
+```
+sort -k START[,END][OPTIONS]
+
+  START  = which field to begin the key
+  END    = which field to end the key (inclusive)
+           if omitted: key goes to end of line
+  OPTIONS= modifiers for this specific key
+
+-k1,2   → key from field 1 TO field 2 (inclusive)
+           "2025-12-18 14:22:10" — both fields together as one key
+           ↑ field 1             ↑ field 2
+
+-k3,3   → key from field 3 TO field 3 (just field 3)
+           "cache01" — hostname only
+
+Without END (dangerous):
+  -k1    → key from field 1 TO END OF LINE
+           "2025-12-18 14:22:10 cache01 CACHE_MISS key=session_abc"
+           ← entire rest of line! Not what we want
+```
+
+### Why `-k1,2` Not `-k1,1 -k2,2`?
+
+```
+sort -k1,1 -k2,2   ← two separate keys
+  Primary:   field 1 = "2025-12-18"
+  Secondary: field 2 = "14:22:10" ← only used when dates are equal
+  Result: dates sort first, then times within same date ✓
+
+sort -k1,2         ← one combined key
+  Primary: fields 1+2 = "2025-12-18 14:22:10"
+  Treated as a SINGLE string for comparison
+  Result: same sort ✓
+
+Both work identically for this log format.
+sort -k1,2 is more concise and conventional.
+```
+
+### How `sort` Determines Field Boundaries
+
+```
+Default field separator = any whitespace (space or tab)
+Consecutive whitespace = ONE separator
+
+"2025-12-18  14:22:10  cache01  CACHE_MISS"
+             ↑↑         ↑↑       ↑↑
+         2 spaces    2 spaces  2 spaces
+         = still just field separators
+
+All these count as the same field positions ✓
+
+Custom separator with -t:
+  sort -t'|' -k1,2  ← pipe-separated fields
+  sort -t','  -k1,2  ← CSV
+  sort -t':'  -k1,2  ← colon-separated
+```
+
+### Why ISO Timestamps Sort Correctly Without `-n`
+
+```
+Timestamps in YYYY-MM-DD HH:MM:SS format sort correctly
+as plain STRINGS — no special numeric flag needed.
+
+Why? Because the most significant component is leftmost:
+  2025-12-18 → year first
+  14:22:10   → hour first
+
+String comparison:
+  "2025-12-18 14:21:30" < "2025-12-18 14:22:10"
+  because at position 14: '1' < '2' in ASCII ✓
+
+This would FAIL with US date format:
+  "12/18/2025" — month first, not year
+  "12/18/2025" < "01/01/2026" ✗ because "1" > "0" for month
+  ISO dates eliminate this problem entirely
+```
+
+### `sort` vs `sort -n` vs `sort -h`
+
+```
+sort          → lexicographic (string comparison)
+               "10" < "9" because '1' < '9' ✗ (bad for numbers)
+               "2025-12-18" < "2025-12-19" ✓ (good for ISO dates)
+
+sort -n       → numeric comparison
+               10 > 9 ✓ (correct for pure numbers)
+               Use for: numeric fields, sizes, counts
+               NOT for: timestamps, hostnames, strings
+
+sort -h       → human-readable numeric
+               "1G" > "512M" > "100K" ✓
+               Use for: du output, file sizes with units
+
+For ISO timestamps → default sort (no flag) is correct ✓
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "Explain `sort -k1,2 -k3,3`. What does each part mean?"
+
+**Answer:**
+> *"`-k` specifies a sort key. `-k1,2` means 'use fields 1 through 2 as the primary sort key' — that's the date and time together forming the complete timestamp. `-k3,3` means 'use only field 3 as the secondary sort key' — the hostname, used only when two lines have identical timestamps. Fields are whitespace-delimited by default. The comma notation `START,END` is important — `-k1` without a comma would use everything from field 1 to end of line, which isn't what we want."*
+
+---
+
+### Q2. "Why doesn't timestamp sorting need `-n` (numeric sort)?"
+
+**Answer:**
+> *"ISO 8601 timestamps — `YYYY-MM-DD HH:MM:SS` — are specifically designed to sort correctly as plain strings. The most significant component (year) is leftmost, so lexicographic comparison naturally gives chronological order. `'2025-12-18 14:21:30' < '2025-12-18 14:22:10'` works correctly because the sort engine compares character by character from the left. This would break with US-format dates (`MM/DD/YYYY`) where December comes before January in string sort. ISO dates are the correct format for any system that needs sortable timestamps."*
+
+---
+
+### Q3. "What's the difference between `-k1,2` and `-k1,1 -k2,2`?"
+
+**Answer:**
+> *"They produce the same result for this log format, but they're conceptually different. `-k1,2` treats fields 1 and 2 as a single combined key — sort uses the date+time string `'2025-12-18 14:22:10'` as one atomic key. `-k1,1 -k2,2` uses field 1 as the primary key and field 2 as a secondary key — sort first sorts by date alone, then by time only when dates are equal. For this problem they're equivalent, but `-k1,2` is more concise and conventional for timestamp sorting."*
+
+---
+
+### Q4. "What does `-k3,3` instead of just `-k3` do? Why the comma?"
+
+**Answer:**
+> *"Without the comma — `-k3` — sort uses everything from field 3 to the end of the line as the key. That would mean the hostname PLUS the entire action field becomes the hostname key, which sorts correctly only coincidentally. `-k3,3` precisely specifies field 3 only, stopping before field 4. The `START,END` syntax is a fundamental part of how `sort -k` works — always specify both unless you intentionally want everything to end of line. A common bug is `-k1` when `-k1,1` was intended."*
+
+---
+
+### Q5. "How would you sort if the timestamp were in a different format — like epoch seconds?"
+
+**Answer:**
+```bash
+# Log with epoch: 1734534230 api01 GET /health
+sort -k1,1n -k2,2 /tmp/app_combined.log
+# -k1,1n → sort field 1 NUMERICALLY (epoch is a number)
+# Without -n: "1734534230" < "999999999" ← wrong (string sort)
+# With -n:    1734534230 > 999999999    ← correct (numeric sort)
+
+# Log with US dates: "12/18/2025 14:22:10 api01..."
+# Problem: can't sort directly — need to transform first
+sort -t'/' -k3,3 -k1,2 file.log  # sort by year(3), then month/day(1,2)
+# OR: pre-process with awk to convert to ISO first
+awk '{print $3"-"$1"-"$2, $0}' file.log | sort -k1,2 | cut -d' ' -f3-
+```
+
+---
+
+### Q6. "How would you merge and sort multiple log files from different servers?"
+
+**Answer:**
+```bash
+# Method 1: cat all files then sort
+cat /var/log/api01.log /var/log/api02.log /var/log/db01.log \
+    | sort -k1,2 -k3,3 > /tmp/merged_sorted.log
+
+# Method 2: sort each file first, then merge (faster for large files)
+# Pre-sort each file individually:
+for f in /var/log/*.log; do
+    sort -k1,2 -k3,3 "$f" > "${f}.sorted"
+done
+# Then merge-sort (efficient — files already sorted):
+sort -m -k1,2 -k3,3 /var/log/*.sorted > /tmp/merged_sorted.log
+# -m = merge only, assumes inputs are already sorted
+
+# Method 3: glob pattern (cleanest):
+sort -k1,2 -k3,3 /var/log/app-server-*.log > /tmp/merged_sorted.log
+```
+
+---
+
+### Q7. "What's `sort -s` and when does it matter?"
+
+**Answer:**
+> *"`-s` enables stable sort — when two lines compare as equal on the sort key, their original relative order is preserved. GNU sort is stable by default in recent versions, but `-s` guarantees it. It matters when you have additional metadata in lines that you're NOT sorting by, and you want to preserve the insertion order for equal-keyed lines. For example, if two events at the exact same millisecond from the same server arrive in a specific causal order, `-s` ensures that order survives the sort."*
+
+---
+
+### Q8. "How would you verify the sort is correct programmatically?"
+
+**Answer:**
+```bash
+# Check: is every line's timestamp >= previous line's timestamp?
+awk '
+    NR > 1 {
+        curr = $1 " " $2
+        prev_ts = prev
+        if (curr < prev_ts) {
+            print "SORT ERROR at line " NR ": " $0
+            print "  Previous line timestamp: " prev_ts
+            exit 1
+        }
+    }
+    { prev = $1 " " $2 }
+    END { print "Sort order verified: " NR " lines OK" }
+' /tmp/app_sorted.log
+
+# Quick check — pipe through sort again, diff should be empty:
+sort -k1,2 -k3,3 /tmp/app_sorted.log > /tmp/re_sorted.log
+diff /tmp/app_sorted.log /tmp/re_sorted.log \
+    && echo "Sort verified: stable ✓" \
+    || echo "Sort not stable ✗"
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE COMMAND:
+  sort -k1,2 -k3,3 /tmp/app_combined.log > /tmp/app_sorted.log
+
+KEY SYNTAX:
+  sort -k START,END [OPTIONS]
+  -k1,2   → fields 1 through 2 (timestamp = date + time)
+  -k3,3   → field 3 only       (hostname)
+  -k1,1n  → field 1, numeric   (for epoch/number fields)
+  -k1,2r  → fields 1-2, reversed (latest first)
+
+SORT FLAGS:
+  -r  → reverse (descending)
+  -n  → numeric  (for numbers, not dates)
+  -h  → human-readable sizes (1G > 512M > 100K)
+  -u  → unique (remove duplicate lines)
+  -s  → stable (preserve original order for equal keys)
+  -m  → merge (assume inputs already sorted — faster)
+  -t  → field separator (default: whitespace)
+
+MULTI-FILE PATTERNS:
+  cat *.log | sort -k1,2 -k3,3          # merge then sort
+  sort -m -k1,2 *.sorted.log            # merge pre-sorted files
+
+TIMESTAMP FORMAT MATTERS:
+  ISO 8601 (YYYY-MM-DD HH:MM:SS) → sorts correctly as string ✓
+  US format (MM/DD/YYYY)          → doesn't sort correctly ✗
+  Epoch (1734534230)              → needs -n flag             ✓ with -n
+
+COMMON -k MISTAKES:
+  -k1   → key from field 1 to END OF LINE (usually wrong)
+  -k1,1 → key is field 1 ONLY            (usually correct)
+  -k1,2 → key is fields 1 AND 2          (timestamp = date+time)
+
+VERIFY SORT:
+  sort -c -k1,2 -k3,3 file.log   # -c checks sort order, exits non-zero if unsorted
+```
+
+> **Airbnb interview tip:** They deal with multi-region, multi-datacenter log aggregation at massive scale. Mention `sort -m` for merge-sorting pre-sorted files — it's O(n) instead of O(n log n) and critical when combining large sorted shards. Also bring up that for truly large-scale log sorting, they'd use distributed tools like Spark or BigQuery rather than Unix `sort` — showing you know when to use which tool is exactly the senior-level thinking Airbnb looks for.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Throttle High I/O Process
+> **Company:** Ebay | **Difficulty:** Easy
+---
+#### **Scenario**
+A server is experiencing latency spikes and intermittent timeouts. CPU and memory appear normal, suggesting a disk I/O bottleneck from a runaway process.
+#### **Task**
+Identify the process causing high disk I/O using real-time monitoring, then apply I/O throttling to reduce its disk priority to idle class without terminating it.
+#### **Example**
+```
+# Before (high I/O process)
+Total DISK READ:       125.43 M/s | Total DISK WRITE:        89.32 M/s
+  TID  PRIO  USER     DISK READ  DISK WRITE  SWAPIN     IO>    COMMAND
+ 5432 be/4 postgres   98.45 M/s   67.23 M/s  0.00 %  95.32 % postgres: autovacuum worker
+```
+```
+# After (I/O throttled)
+Total DISK READ:        12.34 M/s | Total DISK WRITE:         8.92 M/s
+  TID  PRIO  USER     DISK READ  DISK WRITE  SWAPIN     IO>    COMMAND
+ 5432 idle postgres    9.12 M/s    6.45 M/s  0.00 %  12.34 % postgres: autovacuum worker
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/throttle-high-io-process)
+
+
+## Throttle High I/O Process — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### Why I/O Bottlenecks Feel Like CPU Problems
+
+```
+Symptom:  latency spikes, timeouts
+First guess: CPU overload?
+
+Check CPU → normal 20%
+Check RAM  → normal 40%
+           ↓
+The hidden culprit: DISK I/O
+
+One process hogging 98 MB/s of disk reads
+  → Every other process WAITS in disk queue
+  → Requests time out waiting for data
+  → Server appears "slow" with normal CPU/RAM
+```
+
+### The Linux I/O Scheduling Stack
+
+```
+Process A needs disk   ──┐
+Process B needs disk   ──┤──► [ I/O Scheduler ] ──► Disk Driver ──► Disk
+Process C needs disk   ──┘
+                            ↑
+                    Decides WHO gets disk access
+                    and HOW MUCH bandwidth each gets
+
+Without priorities: everyone competes equally
+                    → runaway process monopolizes disk
+
+With ionice:        you assign priority classes
+                    → critical processes guaranteed access
+                    → runaway process only gets leftovers
+```
+
+### The Three I/O Priority Classes
+
+```
+┌──────────────────────────────────────────────────┐
+│  realtime (class 1)  ← ALWAYS first, max priority │
+├──────────────────────────────────────────────────┤
+│  best-effort (class 2) ← default for all processes│
+│    level 0 (highest)                              │
+│    level 1                                        │
+│    level 2                                        │
+│    level 3                                        │
+│    level 4  ← default                             │
+│    level 5                                        │
+│    level 6                                        │
+│    level 7 (lowest within class)                  │
+├──────────────────────────────────────────────────┤
+│  idle (class 3)  ← ONLY when disk is otherwise idle│
+└──────────────────────────────────────────────────┘
+
+Setting runaway process to idle:
+  "You may use disk ONLY when nobody else needs it"
+  Process continues running — just waits for idle disk time
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Simulate the I/O-Heavy Process### Step 2 — Diagnose: Find the I/O Offender### Step 3 — Apply the Fix: `ionice` to Idle Class`none: prio 0` → `idle`. Throttled without terminating.
+
+### Step 4 — Protect Critical Processes at High Priority### Step 5 — Full Summary and Production Patterns---
+
+## Part 3: Every Concept Explained Simply
+
+### `/proc/PID/io` — Reading I/O Without iotop
+
+```
+cat /proc/522/io
+
+rchar: 2048000        ← bytes read by process (includes cache)
+wchar: 63481716736    ← bytes written by process (includes cache)
+syscr: 272089         ← number of read() syscalls
+syscw: 157167         ← number of write() syscalls
+read_bytes: 1011712   ← bytes actually read from DISK (bypassed cache)
+write_bytes: 63481716736 ← bytes actually written to DISK
+cancelled_write_bytes: 0 ← writes cancelled before hitting disk
+
+read_bytes and write_bytes = actual disk I/O
+(iotop shows these as rates — KB/s, MB/s)
+
+Snapshot-based rate calculation:
+  read1 = read_bytes at t=0
+  read2 = read_bytes at t=1
+  rate  = (read2 - read1) KB/s
+```
+
+### The CFQ / BFQ Scheduler — How `ionice` Works Internally
+
+```
+ionice sets a flag in the kernel for your process.
+The I/O scheduler reads this flag when queuing disk requests.
+
+BFQ (Budget Fair Queuing) — modern Linux default:
+  Each process gets a "budget" of I/O bandwidth
+  Budget size ∝ I/O priority class + level
+
+  idle class:  budget = ZERO
+               queued ONLY when all other budgets exhausted
+               "runs in the gaps"
+
+  be/4 (default): budget = baseline
+  be/0 (highest): budget = 8x baseline
+
+  Process reads faster → gets MORE budget (reward)
+  (BFQ learns access patterns and optimizes)
+
+ionice -c 3 effectively tells BFQ:
+  "Don't allocate any budget to this process
+   unless the disk is truly sitting idle"
+```
+
+### `nice` vs `ionice` — Completely Independent
+
+```
+nice / renice   → CPU scheduling priority
+                  -20 (greedy) to +19 (generous)
+                  Controls how much CPU time a process gets
+
+ionice          → I/O scheduling priority
+                  idle/best-effort/realtime
+                  Controls how much disk bandwidth a process gets
+
+A process can be:
+  CPU-greedy  + I/O-idle    (intensive computation, light disk)
+  CPU-nice    + I/O-greedy  (idle CPU but hammering disk)
+  CPU-nice    + I/O-idle    (fully backgrounded job)  ← our use case
+
+For backup jobs: always set BOTH:
+  nice -n 19 ionice -c 3 rsync /data /backup
+  ↑ CPU gentle  ↑ I/O gentle
+```
+
+### Why `ionice` Doesn't Always Work (NVMe Warning)
+
+```
+ionice works with: CFQ, BFQ schedulers (traditional HDDs, some SSDs)
+
+NVMe drives use "none" or "mq-deadline" scheduler:
+  cat /sys/block/nvme0n1/queue/scheduler
+  [none] mq-deadline
+
+  With "none": I/O scheduling is done by the hardware
+               ionice has NO EFFECT
+
+Check your disk's scheduler:
+  cat /sys/block/sda/queue/scheduler   # HDD
+  cat /sys/block/nvme0n1/queue/scheduler  # NVMe
+
+For NVMe — alternative: cgroups v2 io.weight
+  echo "252:0 100" > /sys/fs/cgroup/myapp/io.weight
+  (device major:minor + weight 1-10000)
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you identify which process is causing disk I/O bottleneck?"
+
+**Answer:**
+```bash
+# Best tool — iotop (real-time, sorted by I/O):
+sudo iotop -bon 2 --only   # batch, 2 samples, active only
+
+# Without iotop — /proc/PID/io (always available):
+for pid in /proc/[0-9]*/io; do
+    pidnum=$(cut -d/ -f3 <<< "$pid")
+    wb=$(awk '/^write_bytes/{print $2}' "$pid" 2>/dev/null || echo 0)
+    comm=$(cat "/proc/$pidnum/comm" 2>/dev/null)
+    echo "$wb $pidnum $comm"
+done | sort -rn | head -5
+
+# iostat for device-level view:
+iostat -x 1 3     # 3 samples, 1 second apart, extended stats
+```
+
+> *"I start with `iotop -o` to see only active I/O processes in real-time. The `IO>` column shows what percentage of time each process is blocked waiting for disk. Combined with `read_bytes`/`write_bytes` from `/proc/<PID>/io`, I can confirm it's actual disk I/O and not just page cache activity."*
+
+---
+
+### Q2. "What does `ionice -c 3 -p <PID>` do? Explain each flag."
+
+**Answer:**
+> *"`ionice` sets the I/O scheduling class and priority for a process. `-c 3` sets class 3 — idle — the lowest possible I/O priority. A process in idle class only gets disk access when no other process needs it — it runs in the gaps. `-p PID` targets an already-running process by its PID rather than launching a new one. The process is NOT killed or paused — it continues executing, but any disk requests it makes are queued behind everyone else's. On a busy server, this can reduce the offending process's I/O from 98 MB/s to under 5 MB/s while keeping critical services unaffected."*
+
+---
+
+### Q3. "What are the three I/O scheduling classes? When would you use each?"
+
+**Answer:**
+
+| Class | Flag | Use Case |
+|-------|------|----------|
+| `realtime` | `-c 1` | Emergency data recovery, video capture, never for normal services — can starve everything else |
+| `best-effort` | `-c 2 -n 0-7` | Normal services; `-n 0` for databases, `-n 4` for apps, `-n 7` for background tasks |
+| `idle` | `-c 3` | Backups, rsync, file indexing, anything non-urgent |
+
+> *"For eBay's scenario: the runaway process gets `-c 3` idle. Databases and user-facing services get `-c 2 -n 0`. Most application processes stay at the default `-c 2 -n 4`."*
+
+---
+
+### Q4. "Does `ionice` work on NVMe SSDs? What's the alternative?"
+
+**Answer:**
+> *"It depends on the I/O scheduler. `ionice` works with CFQ and BFQ schedulers — historically used for HDDs and some SSDs. Modern NVMe drives typically use the `none` scheduler (no queuing, hardware handles it), making `ionice` have little to no effect. Check with `cat /sys/block/nvme0n1/queue/scheduler`. For NVMe, the correct tool is cgroups v2 `io.weight` — you can set relative I/O bandwidth weights per cgroup:"*
+
+```bash
+# Check scheduler:
+cat /sys/block/nvme0n1/queue/scheduler
+
+# cgroups v2 weight (works on any scheduler):
+echo "252:0 100" > /sys/fs/cgroup/backup_job/io.weight
+# Major:minor device number + weight (1-10000, default 100)
+
+# Or via systemd (recommended):
+# IOWeight=50 in [Service] section
+```
+
+---
+
+### Q5. "How do you make the throttle permanent — surviving process restarts?"
+
+**Answer:**
+> *"`ionice` on a PID is ephemeral — when the process exits and restarts, it gets default priority again. For systemd-managed services, set it in the unit file:"*
+
+```ini
+# /etc/systemd/system/backup.service
+[Service]
+IOSchedulingClass=idle       # class 3 — equivalent to ionice -c 3
+IOSchedulingPriority=7       # sub-priority (0-7, only used for class 2)
+Nice=19                      # CPU throttle too
+
+# For a critical service needing high I/O:
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0       # highest within class 2
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart backup.service
+# Now always starts with idle I/O priority ✓
+```
+
+---
+
+### Q6. "What's the difference between `iotop`, `iostat`, and reading `/proc/PID/io`?"
+
+**Answer:**
+
+| Tool | Shows | Use When |
+|------|-------|----------|
+| `iotop` | Real-time per-process I/O rates (KB/s) | Finding which process is actively hammering disk right now |
+| `iostat` | Device-level stats (disk utilization, await time) | Confirming the disk itself is saturated, finding which device |
+| `/proc/PID/io` | Cumulative totals since process started | Calculating rates manually, scripting, when iotop unavailable |
+
+> *"`iostat -x` showing `%util` near 100% confirms disk saturation. `iotop -o` identifies the culprit process. `/proc/PID/io` is the fallback when tools aren't installed — it's always available since it's part of the Linux kernel's proc filesystem."*
+
+---
+
+### Q7. "After setting ionice, how do you verify it's working?"
+
+**Answer:**
+```bash
+# Verify priority was set:
+ionice -p <PID>
+# Should show: idle
+
+# Verify disk utilization dropped (watch for 10 seconds):
+iostat -x 1 10 | grep -E "Device|sda|vda"
+
+# Watch I/O rate for the specific PID (snapshot comparison):
+get_io() { awk '/write_bytes/{print $2}' /proc/$1/io 2>/dev/null; }
+W1=$(get_io $PID); sleep 2; W2=$(get_io $PID)
+echo "Write rate: $(( (W2-W1)/2 )) bytes/sec"
+
+# Or with iotop targeted at just that PID:
+iotop -p <PID> -b -n 3
+```
+
+---
+
+### Q8. "A backup job is scheduled at 2 AM. How would you ensure it never impacts production I/O?"
+
+**Answer — the complete production approach:**
+
+```bash
+# Method 1: wrapper script (immediate)
+#!/bin/bash
+exec ionice -c 3 nice -n 19 /usr/bin/rsync -av /data /backup
+
+# Method 2: systemd timer + service (best practice)
+# /etc/systemd/system/nightly-backup.service
+[Unit]
+Description=Nightly Backup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rsync -av /data /backup
+IOSchedulingClass=idle       # never competes with production
+IOSchedulingPriority=7
+Nice=19
+CPUWeight=10                 # also limit CPU (cgroups v2)
+MemoryMax=512M              # prevent memory pressure too
+
+# /etc/systemd/system/nightly-backup.timer
+[Unit]
+Description=Run backup daily at 2 AM
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+> *"Using systemd ensures the I/O class persists across retries, doesn't rely on a wrapper script being called correctly, and integrates with monitoring. The `CPUWeight` and `MemoryMax` settings ensure the backup can't impact production in any resource dimension — not just I/O."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+FIND I/O OFFENDER:
+  iotop -bon 2 --only                    # best tool — real-time rates
+  for p in /proc/[0-9]*/io; do           # no tools needed
+    echo "$(awk '/write_bytes/{print $2}' $p) $(cut -d/ -f3 <<<$p)"
+  done | sort -rn | head -5
+
+THROTTLE (immediate):
+  ionice -c 3 -p <PID>                   # set to idle class
+  ionice -p <PID>                        # verify: shows "idle"
+
+PROTECT CRITICAL SERVICES:
+  ionice -c 2 -n 0 -p $(pgrep postgres)  # highest best-effort
+  ionice -c 2 -n 0 -p $(pgrep mysql)
+
+I/O CLASSES:
+  -c 1  realtime   ← highest, can starve others
+  -c 2  best-effort ← default, use -n 0-7 for sub-priority
+  -c 3  idle        ← only when disk idle ← use for throttling
+
+LAUNCH WITH PRIORITY:
+  ionice -c 3 rsync /data /backup        # start idle
+  nice -n 19 ionice -c 3 rsync ...       # CPU + I/O throttled
+
+PERMANENT (systemd):
+  IOSchedulingClass=idle
+  IOSchedulingPriority=7   (only for class 2)
+
+CHECK SCHEDULER (ionice only works with bfq/cfq):
+  cat /sys/block/sda/queue/scheduler
+  [bfq] → ionice works ✓
+  [none] → use cgroups io.weight instead
+
+VERIFY DISK PRESSURE:
+  iostat -x 1 5 | awk '/^vda|^sda/{print $1, "util:", $NF"%"}'
+  cat /proc/<PID>/io | grep bytes
+```
+
+> **eBay interview tip:** eBay runs one of the world's highest-volume e-commerce platforms — disk I/O during peak sales events (eBay Open, holiday shopping) is critical. Mention that `ionice` is the immediate fix, but the **production-grade answer** is `IOSchedulingClass=idle` in systemd units for all non-critical batch jobs, combined with disk I/O monitoring alerts in Prometheus/Grafana at 70% `%util` threshold. Prevention beats reaction — that's the senior SRE answer they want.
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Trace Process Service Ownership
+> **Company:** NVIDIA | **Difficulty:** Hard
+---
+#### **Scenario**
+A process is consuming excessive resources, but its origin is unclear.
+#### **Task**
+Create a utility script at `/home/devops/trace_service.sh` that accepts a **PID** argument and outputs its managing systemd service name, full status, and the last 20 log entries.
+`trace_service.sh Example:`
+```sh
+#!/bin/bash
+PID=$1
+echo "PID: $PID"
+# Extract service name managing this PID using systemd
+# Hint: systemd can resolve a PID back to its unit
+SERVICE=""
+echo "SERVICE: $SERVICE"
+echo "---- STATUS ----"
+# Hint: show full systemd status for the identified service with --no-pager flag
+echo "---- LOGS ----"
+# Hint: show the last 20 log entries for the service from journald with --no-pager flag
+```
+#### **Example**
+Running the script should produce a structured report similar to this:
+```text
+root@server:~# ./trace_service.sh 4567
+Service Identified: nginx.service
+--- Status ---
+● nginx.service - A high performance web server
+   Loaded: loaded (/lib/systemd/system/nginx.service; enabled)
+   Active: active (running) since Fri 2025-12-19 14:00:00 UTC; 1h ago
+ Main PID: 4567 (nginx)
+--- Last 20 Logs ---
+Dec 19 14:00:01 server nginx[4567]: Starting web server...
+Dec 19 14:00:02 server nginx[4567]: Configuration loaded successfully.
+...
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/trace-process-service-ownership)
+
+
+## Trace Process Service Ownership — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### The Problem
+
+```
+You see this in top/ps:
+  PID  %CPU  %MEM  COMMAND
+  4567  89.3  45.2  python3
+
+Questions:
+  • What systemd service spawned this?
+  • Is it supposed to be running like this?
+  • What does its full status show?
+  • What do its recent logs say?
+
+Without context, you can't answer any of these.
+This script automates ALL of them from one PID.
+```
+
+### How systemd Tracks Processes — cgroups
+
+```
+systemd uses Linux control groups (cgroups) to track processes.
+Every process spawned by a service lives in a cgroup named after that service.
+
+Hierarchy:
+  /sys/fs/cgroup/
+  └── system.slice/
+      ├── nginx.service/     ← nginx processes live here
+      │   ├── PID 4567
+      │   └── PID 4568
+      ├── mysql.service/     ← mysql processes live here
+      └── sshd.service/
+
+Reading /proc/PID/cgroup reveals:
+  0::/system.slice/nginx.service
+                   ↑
+          the service name is RIGHT THERE
+```
+
+### The Two Resolution Paths
+
+```
+Path 1: systemctl status <PID>    ← asks systemd directly
+         systemd looks up which unit owns this PID
+         returns full service status
+
+Path 2: /proc/PID/cgroup           ← reads kernel directly
+         parse the cgroup path
+         extract service name from path string
+         then query systemctl with the service name
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Understand the Key Building Blocks### Step 2 — Build the Script Incrementally### Step 3 — Write the Complete Script### Step 4 — Test the Script---
+
+## Part 3: Every Concept Explained Simply
+
+### How systemd Links PIDs to Services — cgroups
+
+```
+cgroup = Control Group — Linux kernel mechanism to:
+  • Track which processes belong to which group
+  • Apply resource limits per group
+  • Account for resource usage per group
+
+systemd maps ONE service → ONE cgroup
+
+/sys/fs/cgroup/system.slice/
+├── nginx.service/       ← all nginx processes
+│   ├── 4566  (master)
+│   ├── 4567  (worker)  ← THIS is our mystery PID
+│   └── 4568  (worker)
+├── mysql.service/
+│   └── 3210
+
+Reading /proc/4567/cgroup reveals:
+  0::/system.slice/nginx.service
+                   ↑
+           service name embedded here
+
+This is the KERNEL'S answer — doesn't require
+asking systemd at all. Always available.
+```
+
+### The Four Service Resolution Methods — Why Each Exists
+
+```
+Method 1: /proc/PID/cgroup (cgroup v2)
+  When: Modern Linux (kernel 4.5+), systemd 219+
+  Path: "0::/system.slice/nginx.service"
+  Extract: everything after last slash before .service
+  Fastest, no IPC needed
+
+Method 2: systemctl status <PID>
+  When: systemd is running as PID 1
+  How:  systemd keeps an internal map: PID → unit
+        systemctl queries systemd over D-Bus
+  Most user-friendly output
+  Requires D-Bus connection
+
+Method 3: /proc/PID/cgroup (cgroup v1)
+  When: older kernels, hybrid cgroup setups
+  Path: "1:name=systemd:/system.slice/nginx.service"
+  Same info, different format — needs different parser
+
+Method 4: scan MainPID of all units
+  When: methods 1-3 all fail
+  Slow: queries every service unit one by one
+  Last resort: always works if service is running
+```
+
+### `systemctl status <PID>` — Hidden Feature
+
+```bash
+# Most people know:
+systemctl status nginx.service   ← by service name
+
+# Few people know:
+systemctl status 4567             ← by PID number!
+
+systemd does the lookup:
+  "Which service contains PID 4567?"
+  → checks its internal cgroup map
+  → returns full status of nginx.service
+
+Output includes:
+  ● nginx.service          ← unit name (extract this)
+  Main PID: 4566 (nginx)   ← service's main PID
+  CGroup: ...              ← all PIDs in the service
+     ├─4566
+     ├─4567               ← our original PID is here
+     └─4568
+```
+
+### `journalctl -u SERVICE -n 20 --no-pager`
+
+```bash
+journalctl         → query systemd journal
+  -u nginx.service → filter: only this unit's logs
+  -n 20            → last 20 lines (like tail -n 20)
+  --no-pager       → don't pipe through less
+                     output goes directly to stdout ← critical for scripts!
+
+Without --no-pager in a script:
+  journalctl would invoke 'less'
+  Script hangs waiting for user input
+  Output is never captured properly
+
+Other useful journalctl options:
+  --since "1 hour ago"   → time-bounded logs
+  -p err                 → only error-level entries
+  -f                     → follow (like tail -f)
+  --output=json          → structured output
+  -x                     → add explanatory text
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How does your script map a PID to a systemd service name?"
+
+**Answer:**
+> *"I use a four-method cascade in order of reliability. First, I read `/proc/PID/cgroup` and extract the `.service` component from the cgroup path — on modern cgroup v2 systems the path looks like `0::/system.slice/nginx.service`, so the service name is literally embedded in the string. Second, I call `systemctl status <PID>` which asks systemd directly over D-Bus. Third, I handle cgroup v1 format which has a different path structure. Fourth, as a last resort, I scan all units looking for one whose `MainPID` matches. The cascade ensures the script works across different systemd versions and cgroup configurations."*
+
+---
+
+### Q2. "What is a cgroup and why does systemd use them?"
+
+**Answer:**
+> *"A cgroup — control group — is a Linux kernel feature for grouping processes together to track and limit their resource usage. systemd creates one cgroup per service unit and puts all processes spawned by that service into it. This solves several problems simultaneously: it tracks all processes belonging to a service (including children and workers), it enforces resource limits defined in the unit file with `MemoryMax`, `CPUWeight` etc., and it enables clean service shutdown by sending signals to the entire cgroup rather than hunting for child processes individually. The cgroup path in `/proc/PID/cgroup` is essentially the kernel saying 'this process is a member of this service's group'."*
+
+---
+
+### Q3. "What does `--no-pager` do and why is it critical in scripts?"
+
+**Answer:**
+> *"Without `--no-pager`, both `systemctl` and `journalctl` pipe their output through `less` — an interactive pager that waits for user input. In a script, this causes the script to hang indefinitely waiting for someone to press `q`. `--no-pager` bypasses this and sends output directly to stdout, which the script can capture, pipe, or redirect normally. It's a rule of thumb: any `systemctl` or `journalctl` call in a script must include `--no-pager`. Same principle applies to `git log` with `--no-pager`, `man` with `--no-pager`, etc."*
+
+---
+
+### Q4. "What does `systemctl status <PID>` return that `ps` doesn't?"
+
+**Answer:**
+> *"`ps` only knows about the single process with that PID — its CPU, memory, command line. `systemctl status <PID>` shows the full service context: whether the service is enabled to start on boot, how long it's been running, its complete process tree (all worker processes under the same service), recent journal entries, and critically the service name which lets you look up configuration, dependencies, and restart policy. It's the difference between seeing one tree and seeing the entire forest it belongs to."*
+
+---
+
+### Q5. "How would you extend the script to also show resource usage and limits?"
+
+**Answer:**
+```bash
+# After identifying SERVICE, add resource section:
+echo "---- RESOURCE USAGE ----"
+systemctl show "$SERVICE" --no-pager \
+    -p MemoryCurrent -p CPUUsageNSec -p TasksCurrent \
+    -p MemoryMax -p CPUWeight -p TasksMax 2>/dev/null | \
+    awk -F= '{
+        if($1=="MemoryCurrent") printf "  Memory now:   %.1f MB\n", $2/1048576
+        if($1=="MemoryMax")     printf "  Memory limit: %s\n", ($2=="infinity"?"unlimited":$2/1048576" MB")
+        if($1=="TasksCurrent")  printf "  Tasks now:    %s\n", $2
+        if($1=="CPUWeight")     printf "  CPU weight:   %s\n", $2
+    }'
+```
+
+---
+
+### Q6. "What if the process was spawned by a script that was spawned by systemd — not a direct child?"
+
+**Answer:**
+> *"It still works — cgroups are hierarchical and inherited. When systemd starts a service, all processes it spawns go into that service's cgroup, including grandchildren, great-grandchildren, scripts calling scripts. `/proc/any_descendant_pid/cgroup` shows the ancestor service's cgroup path regardless of depth. This is one of the core values of cgroups over traditional process tracking — you don't need to trace the parent chain manually, the kernel maintains the group membership for you."*
+
+---
+
+### Q7. "How would you add alerting if this script detects a service consuming over a threshold?"
+
+**Answer:**
+```bash
+# Add to script after extracting SERVICE and resource usage:
+MEM_KB=$(awk '/^VmRSS:/{print $2}' /proc/$PID/status 2>/dev/null)
+MEM_THRESHOLD=512000  # 512 MB in KB
+
+if [ -n "$MEM_KB" ] && [ "$MEM_KB" -gt "$MEM_THRESHOLD" ]; then
+    MSG="ALERT: $SERVICE on $(hostname) is using ${MEM_KB}KB RAM (threshold: ${MEM_THRESHOLD}KB)"
+    echo "$MSG"
+    # Send alert:
+    echo "$MSG" | mail -s "High memory: $SERVICE" ops@nvidia.com
+    # Or: curl -X POST https://hooks.slack.com/... -d "{\"text\":\"$MSG\"}"
+    # Or: systemctl kill "$SERVICE"  # emergency shutdown
+fi
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE SCRIPT COMMANDS:
+  cat /proc/$PID/cgroup                    # raw cgroup path
+  grep -oP '(?<=/)[^/]+\.service' ...      # extract service name
+  systemctl status $PID --no-pager         # service status by PID
+  systemctl status $SERVICE --no-pager     # service status by name
+  journalctl -u $SERVICE -n 20 --no-pager  # last 20 log lines
+
+SERVICE RESOLUTION CASCADE:
+  1. /proc/$PID/cgroup  (cgroup v2: "0::/system.slice/svc.service")
+  2. systemctl status $PID (D-Bus query to systemd)
+  3. /proc/$PID/cgroup  (cgroup v1: different format)
+  4. scan MainPID of all units (last resort)
+
+KEY /proc FILES:
+  /proc/$PID/comm     → process name
+  /proc/$PID/cgroup   → cgroup path (contains service name)
+  /proc/$PID/status   → UID, PPID, VmRSS, state
+  /proc/$PID/cmdline  → full command line (null-separated)
+  /proc/$PID/fd/      → open file descriptors
+
+JOURNALCTL FLAGS:
+  -u <unit>           → filter by service
+  -n 20               → last 20 lines
+  --no-pager          → ALWAYS in scripts
+  --since "1h ago"    → time range
+  -p err              → errors only
+  -f                  → follow (like tail -f)
+  -x                  → explanatory messages
+  --output=json       → structured output
+
+SYSTEMCTL FLAGS FOR SCRIPTS:
+  --no-pager          → never use pager (ALWAYS add in scripts)
+  show -p MainPID     → get specific property value
+  --value             → show only the value, not key=value
+  list-units --type=service  → list all services
+```
+
+> **NVIDIA interview tip:** They run massive GPU cluster infrastructure where a single runaway process can consume all GPU memory and block other jobs. Mention extending this script with `nvidia-smi` integration — correlate the PID with GPU utilization using `nvidia-smi -q -d PIDS` to show if the process is also a GPU offender. That GPU-aware angle is uniquely relevant at NVIDIA and shows you think beyond generic Linux to their specific domain.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+# Tracing Log File Writes
+> **Company:** Bloomberg | **Difficulty:** Easy
+---
+#### **Scenario**
+The `/var/log/messages` file has been growing unusually fast, filling up disk space within hours.
+#### **Task**
+Identify the process that is writing heavily to `/var/log/messages` by monitoring system activity in real time. Save the process details using `ps` and last `50` lines of logs at `/home/devops/excessive_log_process.txt`
+#### **Example**
+```
+# Before (log file growing rapidly)
+/var/log/messages: 15 GB and increasing
+Disk usage: 92% and climbing
+```
+```
+# After (responsible process identified)
+Process identified: rsyslogd (PID 1234)
+Confirmed active writes to /var/log/messages
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/tracing-log-file-writes)
+
+## Tracing Log File Writes — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Solving?
+
+```
+/var/log/messages is growing at GB/hour
+
+Question: WHO is writing to it?
+
+Three categories of writers:
+
+  Category 1: rsyslogd / syslog-ng
+    The log daemon itself — receives messages from all processes
+    and writes them to /var/log/messages
+    THIS is usually the direct file writer
+
+  Category 2: Applications logging via syslog()
+    App calls syslog() → kernel → rsyslogd → writes to file
+    The app is the SOURCE, rsyslog is the WRITER
+
+  Category 3: Direct file writers
+    App opens /var/log/messages directly and writes
+    Unusual but possible (e.g., buggy scripts)
+
+We need to find BOTH:
+  The direct file writer (has an open fd to the file)
+  The source of excessive messages (who is flooding syslog)
+```
+
+### The Open File Descriptor Chain
+
+```
+Application (PID 1234)
+    │
+    │ syslog("ERROR: something") ← via syslog() syscall
+    │
+    ▼
+/dev/log socket  ← syslog messages go here
+    │
+    ▼
+rsyslogd (PID 567)
+    │
+    │ write() ← rsyslogd writes to file
+    ▼
+/var/log/messages  ← the file growing on disk
+    ↑
+    fd 7 open in rsyslogd's process
+    visible in /proc/567/fd/7 → /var/log/messages
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Scenario### Step 2 — Find Processes with the File Open**fd 3 → /var/log/messages** — confirmed open for writing.
+
+### Step 3 — Full Investigation### Step 4 — Save Full Report to FileReport saved with process details + last 50 log lines. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `/proc/PID/fd/` — The Open File Descriptor Map
+
+```
+Every process has a directory at /proc/PID/fd/
+It contains symbolic links — one per open file descriptor
+
+ls -la /proc/1299/fd/
+  lrwxrwxrwx  0 → /dev/null       ← stdin
+  lrwxrwxrwx  1 → pipe:[1878]     ← stdout
+  lrwxrwxrwx  2 → pipe:[1879]     ← stderr
+  lrwxrwxrwx  3 → /var/log/messages ← FOUND IT ← fd 3 is our file!
+
+readlink /proc/1299/fd/3
+→ /var/log/messages
+
+This is exactly what lsof reads internally.
+No tool installation needed — /proc is always there.
+```
+
+### The `/proc/PID/io` File — Measuring Write Volume
+
+```
+cat /proc/1299/io
+
+rchar:       37643    ← bytes read by read() syscalls (includes cache)
+wchar:         612    ← bytes written by write() syscalls (includes cache)
+syscr:          27    ← number of read() system calls
+syscw:          12    ← number of write() system calls
+read_bytes:      0    ← bytes actually read from PHYSICAL disk
+write_bytes:  12288   ← bytes actually written to PHYSICAL disk ← key metric
+cancelled_write_bytes: 0
+
+write_bytes is the smoking gun:
+  Normal process:       write_bytes = 0-1MB cumulative
+  Excessive log writer: write_bytes = growing by GB/hour
+  
+Rate calculation:
+  w1=$(awk '/write_bytes/{print $2}' /proc/PID/io); sleep 5
+  w2=$(awk '/write_bytes/{print $2}' /proc/PID/io)
+  rate=$(( (w2 - w1) / 5 ))  # bytes per second
+```
+
+### `lsof` vs `/proc/fd/` — Two Ways to Same Answer
+
+```
+lsof /var/log/messages
+  COMMAND  PID  USER  FD  TYPE  SIZE/OFF  NODE  NAME
+  python3  1299 root  4w  REG   4096      123   /var/log/messages
+  ↑ lsof reads /proc internally and formats it nicely
+
+Manual /proc scan (no tools needed):
+  for pid in /proc/[0-9]*/fd; do
+    pidnum=$(cut -d/ -f3 <<< "$pid")
+    for fd in "$pid"/*; do
+      t=$(readlink "$fd" 2>/dev/null)
+      [ "$t" = "/var/log/messages" ] && echo "PID $pidnum"
+    done
+  done
+
+lsof advantages:  formatted output, FD mode (r/w/u), offset
+/proc advantages: always available, no installation, scriptable
+```
+
+### `inotifywait` — Event-Based File Monitoring
+
+```bash
+# Watch for writes to a specific file in real time
+inotifywait -m /var/log/messages
+
+Output:
+  /var/log/messages MODIFY     ← someone wrote to the file
+  /var/log/messages MODIFY
+  /var/log/messages ACCESS
+
+# But this only shows THAT writes are happening
+# To see WHO is writing — combine with /proc fd scan at the moment:
+
+inotifywait -m /var/log/messages | while read path event file; do
+    echo "Write detected!"
+    # Immediately scan /proc to find the writer
+    for pid in /proc/[0-9]*/fd; do
+        pidnum=$(cut -d/ -f3 <<< "$pid")
+        readlink ${pid}/* 2>/dev/null | grep -q "$path" && \
+            echo "  Writer: PID=$pidnum $(cat /proc/$pidnum/comm)"
+    done
+done
+```
+
+### `ps` Output Fields for Investigation
+
+```bash
+ps -p 1299 -o pid,ppid,user,stat,pcpu,pmem,rss,lstart,comm
+
+  PID   = process ID
+  PPID  = parent process ID (who spawned it)
+  USER  = owner
+  STAT  = S=sleeping R=running Z=zombie D=disk wait
+  %CPU  = CPU usage
+  %MEM  = memory percentage
+  RSS   = resident set size (actual RAM in KB)
+  LSTART= when it started (full date+time)
+  COMM  = command name (no path, no args)
+
+For more detail:
+  ps -p 1299 -o pid,ppid,user,stat,pcpu,pmem,rss,lstart,cmd
+  CMD = full command with arguments ← shows the actual script/binary
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find which process is writing to a specific log file?"
+
+**Answer:**
+```bash
+# Primary method — /proc fd scan (no tools needed):
+for pid in /proc/[0-9]*/fd; do
+    pidnum=$(echo "$pid" | cut -d/ -f3)
+    for fd in "$pid"/*; do
+        [ "$(readlink "$fd" 2>/dev/null)" = "/var/log/messages" ] && \
+            echo "PID $pidnum ($(cat /proc/$pidnum/comm)) has it open"
+    done
+done
+
+# With lsof (if installed):
+lsof /var/log/messages
+
+# Quick one-liner:
+grep -rl "/var/log/messages" /proc/[0-9]*/fd 2>/dev/null | \
+    grep -oP '/proc/\d+' | sort -u
+```
+
+> *"I walk `/proc/PID/fd/` for every process. Each fd is a symlink — `readlink` gives the actual path. If it matches my target file, that process has it open. This is exactly what `lsof` does internally."*
+
+---
+
+### Q2. "What is `/proc/PID/fd/` and what does it contain?"
+
+**Answer:**
+> *"Every running process has a directory at `/proc/PID/fd/` containing symbolic links — one per open file descriptor. FD 0, 1, 2 are always stdin, stdout, stderr. Additional FDs point to whatever the process has opened: regular files, sockets, pipes, devices. Each `readlink` gives the actual path. This is the kernel's real-time map of what every process has open — it updates instantly as files are opened and closed. No tool needed, no installation required — it's part of the Linux kernel's proc filesystem."*
+
+---
+
+### Q3. "What does `/proc/PID/io` tell you about write activity?"
+
+**Answer:**
+> *"`write_bytes` in `/proc/PID/io` is the cumulative number of bytes that actually hit the disk for this process since it started. By taking two snapshots a few seconds apart and dividing by the interval, you get the current write rate. `wchar` is bytes written to the write syscalls including cache — it's higher than `write_bytes` because not all writes make it to physical disk. For log file investigation, `write_bytes` growing rapidly is the smoking gun — it confirms the process is flushing to disk, not just writing to a buffer."*
+
+```bash
+# Rate calculation:
+W1=$(awk '/write_bytes/{print $2}' /proc/$PID/io); sleep 3
+W2=$(awk '/write_bytes/{print $2}' /proc/$PID/io)
+echo "Write rate: $(( (W2-W1)/3 )) bytes/sec"
+```
+
+---
+
+### Q4. "What is the difference between `lsof` and reading `/proc/PID/fd`?"
+
+**Answer:**
+> *"Both give the same information — `lsof` is a wrapper around `/proc`. The key differences are: `lsof` formats output nicely, shows FD access mode (r/w/u for read/write/both), byte offset position, and file inode. `/proc/fd` scan is always available — no installation needed, works even on minimal systems. For scripting in production environments where you can't guarantee tools are installed, `/proc` is the reliable approach. `lsof` is better for interactive investigation; `/proc` scan is better for scripts and automation."*
+
+---
+
+### Q5. "How would you distinguish the direct writer vs the syslog source?"
+
+**Answer:**
+> *"Two separate questions. The direct writer — the process with an open fd to the file — is found via `/proc/PID/fd` or `lsof`. On most systems that's `rsyslogd`, which is the log daemon. But rsyslogd just forwards what OTHER processes send via `syslog()`. The real source of excessive messages is found by analyzing the log content itself — `sort | uniq -c | sort -rn` on the hostname or application field to see who is generating the most entries. Then check `logger -t` or `strace -e sendmsg -p $(pgrep rsyslogd)` to see incoming messages in real time."*
+
+```bash
+# Who is generating most log lines?
+awk '{print $5}' /var/log/messages | sort | uniq -c | sort -rn | head -10
+#        ↑ field 5 = process name/PID in standard syslog format
+```
+
+---
+
+### Q6. "How would you monitor file writes in real time without polling?"
+
+**Answer:**
+> *"`inotifywait` from the `inotify-tools` package uses the Linux kernel's inotify API — event-driven, zero polling overhead. It registers interest in specific file events and the kernel notifies you instantly when they occur. For log monitoring:"*
+
+```bash
+# Watch for any write to the file:
+inotifywait -m -e modify /var/log/messages
+
+# Combine with /proc fd scan for attribution:
+inotifywait -m -e modify /var/log/messages 2>/dev/null | \
+while read dir event file; do
+    echo "--- Write detected at $(date +%H:%M:%S) ---"
+    for pid in /proc/[0-9]*/fd; do
+        p=$(echo "$pid" | cut -d/ -f3)
+        readlink ${pid}/* 2>/dev/null | grep -q "/var/log/messages" && \
+            echo "  PID $p: $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)"
+    done
+done
+```
+
+---
+
+### Q7. "What's `strace` and when would you use it for this investigation?"
+
+**Answer:**
+> *"`strace` intercepts and logs system calls made by a process in real time. For log write investigation, `strace -p PID -e trace=write,open` shows every write syscall with its arguments — including the actual content being written. It's more invasive than fd inspection (adds overhead, can slow the process) but gives much deeper insight: you can see exactly what text is being written at the moment it happens."*
+
+```bash
+# Trace writes to a specific fd number (fd 4 in this example):
+strace -p 1299 -e trace=write -e write=4 2>&1 | head -20
+
+# Trace all file opens by rsyslogd:
+strace -p $(pgrep rsyslogd) -e trace=openat,write 2>&1 | grep messages
+
+# See who is SENDING to syslog socket:
+strace -p $(pgrep rsyslogd) -e trace=recvmsg 2>&1 | head -20
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+FIND WRITER (no tools):
+  for pid in /proc/[0-9]*/fd; do
+    p=$(echo "$pid" | cut -d/ -f3)
+    for fd in "$pid"/*; do
+      [ "$(readlink "$fd" 2>/dev/null)" = "/var/log/messages" ] && \
+        echo "PID $p ($(cat /proc/$p/comm))"
+    done
+  done
+
+FIND WRITER (with lsof):
+  lsof /var/log/messages
+  lsof +D /var/log/           # all files in directory
+
+CHECK WRITE RATE:
+  W1=$(awk '/write_bytes/{print $2}' /proc/$PID/io)
+  sleep 5
+  W2=$(awk '/write_bytes/{print $2}' /proc/$PID/io)
+  echo "$(( (W2-W1)/5 )) bytes/sec"
+
+SAVE REPORT:
+  { ps -p $PID -o pid,ppid,user,stat,pcpu,pmem,rss,lstart,cmd;
+    echo "--- LAST 50 LINES ---";
+    tail -50 /var/log/messages; } > /home/devops/excessive_log_process.txt
+
+REAL-TIME MONITORING:
+  inotifywait -m -e modify /var/log/messages   # event-driven
+  watch -n 1 'ls -lh /var/log/messages'        # size polling
+  tail -f /var/log/messages                    # follow content
+
+/proc FILES USED:
+  /proc/$PID/fd/*     → open file descriptors (symlinks)
+  /proc/$PID/io       → cumulative I/O bytes (write_bytes key)
+  /proc/$PID/comm     → process name
+  /proc/$PID/cmdline  → full command (null-delimited)
+  /proc/$PID/status   → UID, PPID, VmRSS, state
+
+FIND LOG SOURCE (who sends most syslog messages):
+  awk '{print $5}' /var/log/messages | sort | uniq -c | sort -rn | head -10
+
+STRACE (deep inspection):
+  strace -p $PID -e trace=write 2>&1 | grep messages
+```
+
+> **Bloomberg interview tip:** Bloomberg's trading systems have zero tolerance for disk saturation — a log flood can cause latency spikes that cost millions in microseconds. They'll push you on **prevention**: mention `rsyslog rate limiting` (`$imuxsock RateLimit.Interval 5` + `RateLimit.Burst 500`) to cap how many messages any process can send per second, and `logrotate --force` for immediate rotation when a file grows unexpectedly. Showing you think about preventing the incident, not just diagnosing it, is what differentiates senior candidates at Bloomberg.
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Track Forking Process Hierarchies
+> **Company:** Splunk | **Difficulty:** Easy
+---
+#### **Scenario**
+System resources are being consumed by an unusually large process tree. You need to identify the parent process with the most children and document its hierarchy.
+#### **Task**
+Identify the process tree with the highest number of child processes and save its hierarchy—including **PIDs** and **full command names (arguments)**—to: `/home/devops/process_tree_report.txt`.
+Linux provides the `pstree` command to display full hierarchical process trees, including PIDs and command arguments.
+#### **Example**
+The file `/home/devops/process_tree_report.txt` should look similar to this:
+```text
+spawn_many_workers.sh,159 /home/devops/spawn_many_workers.sh
+ ├─sleep,209 infinity
+ ├─spawn_many_workers.sh,190 /home/devops/spawn_many_workers.sh
+ │  └─sleep,220 60
+ ├─spawn_many_workers.sh,191 /home/devops/spawn_many_workers.sh
+ ...
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/track-forking-process-hierarchies)
+
+Process tree captured. Now build the complete solution.
+
+### Step 5 — Complete Solution: Find Top Parent + Save ReportReport saved. Output matches the required format.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `pstree` — Every Flag Decoded
+
+```bash
+pstree -p -a $PID
+
+pstree        →  show process TREE (parent → children hierarchy)
+                 without flags: shows names only, collapses identical siblings
+
+  -p          →  show PIDs in parentheses
+                 python3(551) instead of just python3
+
+  -a          →  show full command line ARGUMENTS
+                 python3 /tmp/spawner2.py  instead of  python3
+
+  $PID        →  start tree from this specific root
+                 without: starts from PID 1 (entire system tree)
+
+Output format:
+  python3,551 /tmp/spawner2.py   ← root
+    ├─python3,553 /tmp/spawner2.py   ← child
+    ├─python3,554 /tmp/spawner2.py
+    │   └─python3,566 /tmp/spawner2.py  ← grandchild
+    └─python3,555 /tmp/spawner2.py
+```
+
+### How to Find "Most Children" Without pstree
+
+```bash
+# From ps output: count how many processes have each PPID
+ps -eo pid,ppid --no-headers | \
+    awk '{count[$2]++} END{
+        for(p in count) print count[p], p
+    }' | sort -rn | head -5
+
+# Output:
+# 49  2        ← kthreadd (kernel, ignore)
+# 12  551      ← our spawner ← highest non-kernel
+# 3   1        ← init/systemd
+
+# Exclude kernel threads (PID < 100):
+awk '{count[$2]++} END{
+    for(p in count) if(p+0>100) print count[p], p
+}' | sort -rn | head -1
+```
+
+### The PPID Chain — Reading Process Ancestry
+
+```
+Every process in /proc/PID/status has a PPid line:
+
+cat /proc/566/status | grep -E "^(Name|Pid|PPid)"
+  Name: python3
+  Pid:  566
+  PPid: 563       ← parent is 563
+
+cat /proc/563/status | grep -E "^(Name|Pid|PPid)"
+  Name: python3
+  Pid:  563
+  PPid: 551       ← grandparent is 551
+
+cat /proc/551/status | grep -E "^(Name|Pid|PPid)"
+  Name: python3
+  Pid:  551
+  PPid: 1         ← great-grandparent is init
+
+So PID 566 ancestry chain: 566 → 563 → 551 → 1
+pstree shows this as:
+  python3,551
+    └─python3,563
+        └─python3,566  ← us
+```
+
+### `pstree -p` Output — Extracting PIDs Programmatically
+
+```bash
+pstree -p 551
+# python3(551)─┬─python3(553)
+#              ├─python3(554)
+#              ├─python3(563)─┬─python3(565)
+#              │              └─python3(567)
+#              └─python3(564)─┬─python3(566)
+#                             └─python3(568)
+
+# Extract all PIDs from pstree output:
+pstree -p 551 | grep -oP '\(\d+\)' | tr -d '()'
+# 551 553 554 563 565 567 564 566 568
+
+# Count total processes in tree:
+pstree -p 551 | grep -oP '\(\d+\)' | wc -l
+# 9
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find the process with the most child processes?"
+
+**Answer:**
+```bash
+# Count direct children per PPID:
+ps -eo pid,ppid --no-headers | \
+    awk '{c[$2]++; n[$2]=$3} END{
+        for(p in c) if(p+0>100) print c[p], p
+    }' | sort -rn | head -5
+
+# One-liner to get just the top PID:
+ps -eo ppid --no-headers | sort | uniq -c | sort -rn | \
+    awk 'NR==1{print $2}'
+```
+
+> *"I count how many processes share each PPID — that's the direct child count per parent. I filter out kernel threads (PID < 100) since `kthreadd` always has many kernel worker children that aren't application processes. The process with the highest count is the top offender."*
+
+---
+
+### Q2. "What does `pstree -p -a` show and why use both flags?"
+
+**Answer:**
+> *"`pstree` by default shows just process names and collapses identical siblings — `10*[python3]` instead of listing each one. `-p` adds the PID in parentheses after each name, which is essential for investigation — you need PIDs to send signals, check `/proc`, or reference specific processes. `-a` shows the full command line with arguments — without it you only see `python3` not `python3 /home/devops/spawn_workers.sh`, losing critical context about what the process is actually doing. Together they give a complete picture: who is running what, with exact PIDs."*
+
+---
+
+### Q3. "What's the difference between direct children and total descendants?"
+
+**Answer:**
+> *"Direct children are processes whose PPID equals the parent's PID — immediate forks. Total descendants include children, grandchildren, great-grandchildren — everyone who can trace their ancestry back to the root. In `pstree`, direct children appear at the first indent level under the parent. For resource investigation, direct children matters for 'is this process forking excessively?' while total descendants matters for 'what's the total resource footprint of this entire process family?' A process that spawns 5 children who each spawn 20 grandchildren has 5 direct children but 105 total descendants."*
+
+---
+
+### Q4. "How would you kill an entire process tree including all descendants?"
+
+**Answer:**
+```bash
+# Method 1: kill by process group (if all in same group)
+kill -TERM -$PID    # negative PID = kill process group
+
+# Method 2: pkill with -P (parent PID)
+pkill -TERM -P $PID  # kill direct children only
+# Recursive: need a loop
+
+# Method 3: kill entire subtree recursively
+kill_tree() {
+    local pid=$1
+    # Kill children first (bottom-up)
+    for child in $(ps -o pid --no-headers --ppid $pid 2>/dev/null); do
+        kill_tree $child
+    done
+    kill -TERM $pid 2>/dev/null
+}
+kill_tree $TOP_PID
+
+# Method 4: use pstree to get all PIDs, then kill
+pstree -p $TOP_PID | grep -oP '\(\d+\)' | tr -d '()' | \
+    xargs kill -TERM 2>/dev/null
+
+# Method 5: systemd/cgroups (cleanest — kills entire cgroup)
+systemctl stop $SERVICE_NAME
+```
+
+---
+
+### Q5. "What is `/proc/PID/status` and what fields are useful for process hierarchy investigation?"
+
+**Answer:**
+```bash
+cat /proc/551/status
+
+# Key fields for hierarchy investigation:
+Name:   python3        ← process name (same as /proc/PID/comm)
+Pid:    551            ← this process's PID
+PPid:   1              ← PARENT PID ← trace ancestry here
+TracerPid: 0           ← 0=not being traced, nonzero=debugger attached
+Uid:    0 0 0 0        ← real/effective/saved/filesystem UID
+Gid:    1000 1000...   ← group IDs
+Threads: 1             ← thread count (>1 = multi-threaded)
+VmRSS:  9688 kB       ← actual RAM in use
+```
+
+> *"`PPid` is the key field — it lets you traverse the ancestry chain manually without any tools. Follow PPid recursively until you reach PID 1 to understand the complete chain of processes that led to this one being spawned."*
+
+---
+
+### Q6. "How would you monitor for new process spawning in real time?"
+
+**Answer:**
+```bash
+# Method 1: watch process count for a parent
+watch -n 1 "ps --ppid $PID --no-headers | wc -l"
+
+# Method 2: auditd (kernel-level fork monitoring)
+auditctl -a always,exit -F arch=b64 -S fork,clone -k fork_monitor
+ausearch -k fork_monitor --interpret | tail -20
+
+# Method 3: eBPF / bpftrace (modern, low overhead)
+bpftrace -e 'tracepoint:syscalls:sys_enter_fork { 
+    printf("fork by PID %d (%s)\n", pid, comm); 
+}'
+
+# Method 4: inotifywait on /proc
+# (watches for new /proc/NNNN directories = new processes)
+inotifywait -m -e create /proc 2>/dev/null | \
+    grep -oP '(?<= )\d+$' | \
+    while read newpid; do
+        comm=$(cat /proc/$newpid/comm 2>/dev/null)
+        ppid=$(awk '/^PPid:/{print $2}' /proc/$newpid/status 2>/dev/null)
+        echo "New PID $newpid ($comm) forked from $ppid"
+    done
+```
+
+---
+
+### Q7. "What does the STAT column mean in `ps` output for child processes?"
+
+```
+ps -o pid,stat,comm
+
+STAT codes:
+  S   ← Sleeping (waiting for event) — most processes
+  R   ← Running (using CPU right now)
+  D   ← Uninterruptible sleep (disk I/O wait)
+  Z   ← Zombie (exited but not reaped) ← parent bug
+  T   ← Stopped (SIGSTOP or debugger)
+
+Second character modifiers:
+  s   ← session leader (started a new session, e.g. shell)
+  +   ← in foreground process group
+  l   ← multi-threaded (has multiple threads)
+  <   ← high priority (negative nice value)
+  N   ← low priority (positive nice value)
+
+For spawned worker processes: Ss or S+ is normal
+Z   = parent has bug (not calling wait()) — zombie accumulation
+D+  = many processes blocked on I/O = disk bottleneck
+```
+
+---
+
+### Q8. "How would you automatically alert when any process exceeds N children?"
+
+**Answer:**
+```bash
+#!/bin/bash
+# /usr/local/bin/fork_monitor.sh
+THRESHOLD=20
+INTERVAL=30
+ALERT_EMAIL="ops@splunk.com"
+
+while true; do
+    # Find any process with more children than threshold
+    OFFENDER=$(ps -eo pid,ppid --no-headers | \
+        awk '{c[$2]++; n[$2]=$1} END{
+            for(p in c) if(c[p]>='$THRESHOLD' && p+0>100) print c[p], p
+        }' | sort -rn | head -1)
+
+    if [ -n "$OFFENDER" ]; then
+        COUNT=$(echo $OFFENDER | awk '{print $1}')
+        PID=$(echo $OFFENDER | awk '{print $2}')
+        CMD=$(tr '\0' ' ' < /proc/$PID/cmdline 2>/dev/null)
+        MSG="ALERT: PID $PID ($CMD) has $COUNT children (threshold: $THRESHOLD)"
+        echo "$MSG"
+        # Save tree snapshot immediately for forensics
+        pstree -p -a $PID > /tmp/fork_alert_$(date +%s).txt
+        echo "$MSG" | mail -s "Fork bomb alert on $(hostname)" "$ALERT_EMAIL"
+    fi
+
+    sleep $INTERVAL
+done
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+KEY PSTREE FLAGS:
+  pstree $PID          → tree from specific root (names only)
+  pstree -p $PID       → include PIDs: python3(551)
+  pstree -a $PID       → include full cmdline args
+  pstree -p -a $PID    → both — BEST FOR INVESTIGATION
+  pstree -s $PID       → show parents (path to root)
+  pstree -n $PID       → sort by PID (numeric order)
+  pstree -c $PID       → don't compact identical branches
+
+EXTRACT PIDs FROM pstree OUTPUT:
+  pstree -p $PID | grep -oP '\(\d+\)' | tr -d '()'
+  pstree -p $PID | grep -oP '\(\d+\)' | wc -l  # count
+
+FIND TOP PARENT BY CHILD COUNT:
+  ps -eo pid,ppid --no-headers | \
+    awk '{c[$2]++} END{for(p in c) if(p>100) print c[p],p}' | \
+    sort -rn | head -1
+
+COUNT DIRECT CHILDREN OF A PID:
+  ps --ppid $PID --no-headers | wc -l
+  ps -eo ppid | grep -c "^ *${PID}$"
+
+FULL ANCESTRY CHAIN (bottom up):
+  pid=$PID
+  while [ "$pid" -gt 1 ]; do
+    printf "PID %s: %s\n" "$pid" "$(cat /proc/$pid/comm)"
+    pid=$(awk '/^PPid:/{print $2}' /proc/$pid/status)
+  done
+
+KILL ENTIRE TREE:
+  pstree -p $PID | grep -oP '\d+' | xargs kill -TERM
+  kill -TERM -$PID   # if same process group
+
+SAVE REPORT:
+  { pstree -p -a $PID; echo "---";
+    ps --ppid $PID -o pid,user,stat,cmd; } \
+    > /home/devops/process_tree_report.txt
+```
+
+> **Splunk interview tip:** Splunk ingests and analyzes machine data at massive scale — they'll love if you mention that `pstree` output can be shipped directly into Splunk for process lineage analysis, and that eBPF tools like `bpftrace` give real-time fork tracing with near-zero overhead. Mentioning that fork bombs are best prevented with `ulimit -u <max_procs>` per user or `TasksMax=` in systemd unit files shows you think prevention, not just diagnosis.
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Update AWS Configs
+Company: Stripe | Difficulty: Medium
+Scenario
+Each application environment (staging, dev, prod) has its own configuration file stored under `/etc/app/envs/`, and each file currently has `multi_az = false` and `availability_zone = "us-east-1a"`. Manually editing each file is error-prone and inefficient, so the change must be automated.
+Task
+Locate all `.conf` files under `/etc/app/envs/` across different environment subdirectories, update the `multi_az` setting from `false` to `true`, modify the `availability_zone` line to include two zones `"us-east-1a,us-east-1b"`, perform these edits in-place while preserving all other configuration values.
+Example
+
+```
+# Before (single-AZ configuration)
+
+region = "us-east-1"
+availability_zone = "us-east-1a"
+multi_az = false
+
+```
+
+
+```
+# After (multi-AZ configuration enabled)
+
+region = "us-east-1"
+availability_zone = "us-east-1a,us-east-1b"
+multi_az = true
+
+```
+
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/update-aws-configs)
+
+
+## Update AWS Configs — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Doing and Why?
+
+```
+Before migration (single-AZ — risk of outage):
+  /etc/app/envs/staging/app.conf   ← multi_az = false
+  /etc/app/envs/dev/app.conf       ← multi_az = false
+  /etc/app/envs/prod/app.conf      ← multi_az = false
+
+Manual edit = dangerous:
+  3 files today → 30 files next month
+  Miss one → prod still single-AZ → outage
+  Typo → broken config → deploy fails
+
+Automated sed = safe and repeatable:
+  find all .conf files → apply same edit to ALL → done
+  Run again = idempotent (already true stays true)
+```
+
+### The Two Target Lines
+
+```
+Line 1: multi_az = false          →  multi_az = true
+Line 2: availability_zone = "us-east-1a"  →  availability_zone = "us-east-1a,us-east-1b"
+
+sed pattern for line 1:
+  s/multi_az = false/multi_az = true/
+
+sed pattern for line 2:
+  s/availability_zone = "us-east-1a"/availability_zone = "us-east-1a,us-east-1b"/
+
+Key requirement: in-place (-i flag)
+  Without -i: sed prints to stdout, file unchanged
+  With -i:    sed edits the file directly on disk
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Environment### Step 2 — Understand `sed` Before Running### Step 3 — Backup First, Then Apply In-Place### Step 4 — Verify: Before vs AfterAll 5 files updated. All other values untouched. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `sed -i` — In-Place Editing Explained
+
+```
+Without -i (default):   sed reads file → processes → writes to STDOUT
+                        Original file: UNCHANGED
+                        Terminal output: changed version
+
+With -i (in-place):     sed reads file → processes → writes BACK to file
+                        Original file: CHANGED
+                        Terminal output: nothing (silent)
+
+With -i.bak (GNU sed):  sed reads file → writes changed to file
+                        → saves ORIGINAL to file.bak automatically
+                        (one command = edit + backup)
+
+# macOS sed vs GNU sed difference:
+  GNU sed (Linux): sed -i 's/old/new/' file    ← works
+  macOS sed (BSD): sed -i '' 's/old/new/' file ← needs empty string
+```
+
+### `sed -e` — Multiple Expressions in One Pass
+
+```bash
+# Two separate sed calls (TWO passes through file):
+sed -i 's/multi_az = false/multi_az = true/' file
+sed -i 's/availability_zone = "us-east-1a"/.../' file
+
+# One sed call with -e (ONE pass through file — faster):
+sed -i \
+    -e 's/multi_az = false/multi_az = true/' \
+    -e 's/availability_zone = "us-east-1a"/.../' \
+    file
+
+# Equivalently, using semicolon separator:
+sed -i 's/multi_az = false/multi_az = true/; s/availability_zone.../.../' file
+
+# When does ONE pass matter?
+# When both patterns could match the same line
+# With two passes: second sed runs on OUTPUT of first
+# With one pass:   both substitutions run on ORIGINAL line
+```
+
+### The `find -exec {} +` vs `-exec {} \;`
+
+```bash
+# {} \;  — runs command ONCE PER FILE
+find /etc/app/envs/ -name "*.conf" -exec sed -i 's/x/y/' {} \;
+# Spawns: sed file1, sed file2, sed file3 ...
+# N files = N processes = slower
+
+# {} +   — batches files together (like xargs)
+find /etc/app/envs/ -name "*.conf" -exec sed -i 's/x/y/' {} +
+# Runs: sed file1 file2 file3 ... (all in one call!)
+# Much faster for many files
+
+# BUT for sed -i with multiple files, {} + is correct:
+# sed -i 's/x/y/' file1 file2 file3  ← works ✓
+# sed IS designed to handle multiple files
+```
+
+### Why `! -name "*.bak"` Protects Backups
+
+```
+Without the exclusion:
+  find /etc/app/envs/ -name "*.conf"
+  → /etc/app/envs/prod/app.conf
+  → /etc/app/envs/prod/app.conf.bak   ← oops, found the backup too!
+  sed edits BOTH → backup loses its "before" state
+
+With exclusion:
+  find /etc/app/envs/ -name "*.conf" ! -name "*.bak"
+  → /etc/app/envs/prod/app.conf        ← edited ✓
+  backup stays untouched               ← preserved ✓
+
+  ! -name "*.bak" = NOT matching *.bak
+  (the ! is a logical NOT for the next condition)
+```
+
+### Anchoring Patterns to Avoid Wrong Matches
+
+```bash
+# Naive pattern (risky):
+sed 's/false/true/'
+# Would also change:
+# "false_positive = 'false'" → "true_positive = 'true'"  ← WRONG!
+
+# Better: match the specific key=value pair
+sed 's/multi_az = false/multi_az = true/'
+# Only matches this exact line — other "false" values untouched ✓
+
+# Even better: anchor to start of line with ^
+sed 's/^multi_az = false/multi_az = true/'
+# ^ = must be at line beginning
+# Protects against: "  multi_az = false" (with leading space) — won't match
+# (depends on whether your config has indentation)
+
+# Most robust: use word boundaries or exact key match
+sed 's/^\(multi_az\s*=\s*\)false$/\1true/'
+# \(...\) = capture group (basic regex)
+# \1 = back-reference to capture group
+# Handles: multi_az=false, multi_az = false, multi_az  =  false
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "What does `sed -i` do? What's the difference from regular `sed`?"
+
+**Answer:**
+> *"`sed` by default reads input and writes processed output to stdout — the original file is untouched. The `-i` flag changes that to in-place mode: sed writes the result back into the original file, effectively editing it directly on disk. Some teams use `sed -i.bak` to simultaneously create a backup — GNU sed creates `file.bak` containing the original before overwriting `file` with the changes. The in-place flag is essential for automating config updates across many files since you can't pipe stdout back to the same file you're reading."*
+
+---
+
+### Q2. "Why use `find -exec sed -i {} +` instead of a `while read` loop?"
+
+**Answer:**
+> *"The `{}+` form batches all found files into a single sed invocation — `sed -i 's/x/y/' file1 file2 file3`. A `while read` loop calls sed once per file, spawning a new process for every iteration. For 3 files it doesn't matter; for 3,000 files, the difference is significant. The `while read` loop has one advantage: you can add per-file logging — `echo Updated: $f` — and handle per-file errors. For a simple mass substitution, `{}+` is cleaner and faster. Both are correct; the choice depends on whether you need per-file control."*
+
+---
+
+### Q3. "How would you make the sed pattern more robust to handle variations like `multi_az=false` (no spaces)?"
+
+**Answer:**
+> *"Use `\s*` to match zero or more whitespace characters around the `=`:"*
+
+```bash
+# Handles: "multi_az=false", "multi_az = false", "multi_az  =  false"
+sed -i 's/^multi_az\s*=\s*false/multi_az = true/' file
+
+# OR use extended regex with -E:
+sed -i -E 's/^multi_az\s*=\s*false/multi_az = true/' file
+
+# Even more robust — preserve original spacing:
+sed -i -E 's/^(multi_az\s*=\s*)false/\1true/' file
+# \1 captures "multi_az = " and replaces only "false" with "true"
+# preserving whatever whitespace was around the =
+```
+
+---
+
+### Q4. "How would you verify the changes are correct without modifying files?"
+
+**Answer:**
+> *"Never run sed -i without a dry run first. Use `sed` without `-i` to preview, then `grep` to verify after applying:"*
+
+```bash
+# DRY RUN — see what would change (no -i):
+find /etc/app/envs/ -name "*.conf" ! -name "*.bak" | while read f; do
+    echo "=== $f ==="
+    sed -n 's/multi_az = false/multi_az = true/p' "$f"
+    # -n suppresses default output
+    # p at end of s command prints only MATCHED lines
+done
+
+# POST-CHANGE verification:
+grep -r "multi_az" /etc/app/envs/ --include="*.conf" | grep -v ".bak"
+# Every line should show: multi_az = true
+
+# Verify nothing unwanted changed:
+diff /etc/app/envs/prod/app.conf.bak /etc/app/envs/prod/app.conf
+# Should show exactly 2 changed lines
+```
+
+---
+
+### Q5. "How do you handle the backup automatically within `sed -i`?"
+
+**Answer:**
+> *"GNU sed accepts a suffix after `-i` to create an automatic backup: `sed -i.bak 's/x/y/' file` edits `file` in-place and saves the original as `file.bak`. This is a single atomic operation — you get the edit and the backup in one command without a separate `cp` step:"*
+
+```bash
+# Creates .bak automatically for every file:
+find /etc/app/envs/ -name "*.conf" -type f \
+    -exec sed -i.bak \
+        -e 's/multi_az = false/multi_az = true/' \
+        -e 's/availability_zone = "us-east-1a"/availability_zone = "us-east-1a,us-east-1b"/' \
+    {} +
+
+# Verify backups were created:
+find /etc/app/envs/ -name "*.conf.bak"
+
+# Restore a single file from backup:
+cp /etc/app/envs/prod/app.conf.bak /etc/app/envs/prod/app.conf
+```
+
+---
+
+### Q6. "How would you roll back the changes if something goes wrong?"
+
+**Answer:**
+```bash
+# Restore all files from backups:
+find /etc/app/envs/ -name "*.conf.bak" | while IFS= read -r bak; do
+    original="${bak%.bak}"
+    cp "$bak" "$original"
+    echo "Restored: $original"
+done
+
+# OR use sed to reverse the specific changes:
+find /etc/app/envs/ -name "*.conf" ! -name "*.bak" \
+    -exec sed -i \
+        -e 's/multi_az = true/multi_az = false/' \
+        -e 's/availability_zone = "us-east-1a,us-east-1b"/availability_zone = "us-east-1a"/' \
+    {} +
+
+# Verify rollback:
+grep -r "multi_az" /etc/app/envs/ --include="*.conf" | grep -v ".bak"
+# Should show: multi_az = false
+```
+
+---
+
+### Q7. "What's the difference between `sed` and `awk` for this task? When would you use `awk`?"
+
+**Answer:**
+> *"`sed` is perfect for simple line-by-line substitutions — find a pattern, replace it. `awk` is better when you need to make changes based on field values, conditionally update only certain keys, or process structured data. For this config format, `awk` gives more control:"*
+
+```bash
+# awk approach — same result, more flexible:
+awk '
+    /^multi_az =/ { sub(/false/, "true") }
+    /^availability_zone =/ { sub(/"us-east-1a"/, "\"us-east-1a,us-east-1b\"") }
+    { print }
+' /etc/app/envs/prod/app.conf
+
+# awk advantage: conditional logic
+awk '
+    /^multi_az =/ && /false/ { sub(/false/, "true") }  # only if currently false
+    /^availability_zone =/ && !/,/ { sub(/"([^"]+)"/, "\"&,us-east-1b\"") }  # only if single AZ
+    { print }
+' file
+
+# awk for in-place (use a temp file or GNU awk):
+awk '...' file > file.tmp && mv file.tmp file
+# OR with GNU awk: gawk -i inplace '...' file
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE COMMAND:
+  find /etc/app/envs/ -name "*.conf" ! -name "*.bak" -type f \
+      -exec sed -i \
+          -e 's/multi_az = false/multi_az = true/' \
+          -e 's/availability_zone = "us-east-1a"/availability_zone = "us-east-1a,us-east-1b"/' \
+      {} +
+
+BACKUP FIRST:
+  find /etc/app/envs/ -name "*.conf" -exec cp -p {} {}.bak \;
+  # OR auto-backup in sed:
+  sed -i.bak 's/old/new/' file
+
+DRY RUN (preview only):
+  sed -n 's/multi_az = false/multi_az = true/p' file
+  # -n = suppress normal output
+  # p  = print only substituted lines
+
+VERIFY AFTER:
+  grep -r "multi_az" /etc/app/envs/ --include="*.conf" | grep -v ".bak"
+  grep -rL "us-east-1b" /etc/app/envs/ --include="*.conf"  # files WITHOUT update
+  diff file.bak file                                          # what changed
+
+ROLLBACK:
+  find /etc/app/envs/ -name "*.bak" | while read b; do cp "$b" "${b%.bak}"; done
+
+sed FLAGS:
+  -i         → in-place (edit file directly)
+  -i.bak     → in-place + auto backup original
+  -e         → multiple expressions in one call
+  -n         → suppress default output (use with p flag)
+  -E or -r   → extended regex (enables + ? | without escaping)
+
+PATTERN ROBUSTNESS:
+  s/false/true/           → naive, may hit wrong lines
+  s/multi_az = false/.../  → better, specific key
+  s/^multi_az = false/.../ → best, anchored to line start
+  s/^(key\s*=\s*)false/\1true/  → preserves original whitespace
+
+find + exec:
+  -exec cmd {} \;   → one process per file (slower, more control)
+  -exec cmd {} +    → batch files together (faster, like xargs)
+  ! -name "*.bak"   → exclude backup files from processing
+```
+
+> **Stripe interview tip:** Stripe's infrastructure spans many environments with strict config management. Always mention **idempotency** — running the sed command twice should produce the same result (already-updated `true` won't match `false` pattern). Also bring up **validation after the change** — at Stripe scale you'd run a diff against a known-good template and check config syntax before deploying, not just trust that sed ran without errors. That systematic verification mindset is exactly what Stripe's reliability engineering culture values.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+# Upload Safe File Partitioning
+> **Company:** GoDaddy | **Difficulty:** Medium
+---
+#### **Scenario**
+Your application uploads files from `/tmp/app/`, but the maximum allowed file size is 1 MB, and some files exceed this limit.
+#### **Task**
+Find all files larger than 1 MB in `/tmp/app/` and its subdirectories, split each oversized file into 1 MB chunks in the same directory where the original file is located with a recognizable naming pattern (e.g., original_filename.part_aa), keep the original files intact, and verify that the chunks were created successfully.
+#### **Example**
+```
+# Before (files exceed 1 MB limit)
+/tmp/app/uploads/video.mp4 (3.2 MB)
+/tmp/app/data/archive.tar.gz (2.5 MB)
+Cannot upload due to size restrictions
+```
+```
+# After (files split into 1 MB chunks)
+/tmp/app/uploads/video.mp4
+/tmp/app/uploads/video.mp4.part_aa
+/tmp/app/uploads/video.mp4.part_ab
+/tmp/app/uploads/video.mp4.part_ac
+/tmp/app/data/archive.tar.gz
+/tmp/app/data/archive.tar.gz.part_aa
+/tmp/app/data/archive.tar.gz.part_ab
+Chunks ready for upload within size limits
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/upload-safe-file-partitioning)
+
+
+
+## Upload Safe File Partitioning — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Are We Doing and Why?
+
+```
+Upload API limit: 1 MB per file
+
+Problem:
+  video.mp4     = 3.2 MB  → upload REJECTED ✗
+  archive.tar.gz = 2.5 MB → upload REJECTED ✗
+
+Solution: split into 1 MB chunks, upload each chunk separately
+
+  video.mp4.part_aa = 1 MB  → upload ✓
+  video.mp4.part_ab = 1 MB  → upload ✓
+  video.mp4.part_ac = 1 MB  → upload ✓
+  video.mp4.part_ad = 0.2 MB → upload ✓ (remainder)
+
+On the receiving side: reassemble with:
+  cat video.mp4.part_* > video.mp4
+```
+
+### The `split` Command Naming System
+
+```
+split -b 1M --additional-suffix=".part_" file.mp4 "file.mp4."
+
+Generates:
+  file.mp4.aa    ← auto suffix
+  file.mp4.ab
+  file.mp4.ac
+
+With --additional-suffix=".part_" added AFTER the auto suffix:
+  Wait — that's not right. Let me clarify the naming:
+
+split -b 1M file.mp4 "file.mp4.part_"
+
+The PREFIX is:     "file.mp4.part_"
+The AUTO-SUFFIX is: aa, ab, ac ...
+
+Result:
+  file.mp4.part_aa  ← PREFIX + auto suffix ✓
+  file.mp4.part_ab
+  file.mp4.part_ac
+```
+
+### The Directory Challenge
+
+```
+find returns full paths:
+  /tmp/app/uploads/video.mp4
+  /tmp/app/data/archive.tar.gz
+
+split needs:
+  OUTPUT PREFIX = same directory + filename + .part_
+  /tmp/app/uploads/video.mp4.part_
+
+We build this with:
+  DIRNAME  = $(dirname  "/tmp/app/uploads/video.mp4") = "/tmp/app/uploads"
+  BASENAME = $(basename "/tmp/app/uploads/video.mp4") = "video.mp4"
+  PREFIX   = "${DIRNAME}/${BASENAME}.part_"
+           = "/tmp/app/uploads/video.mp4.part_"
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create the Test Environment### Step 2 — Understand `split` Completely### Step 3 — The Core Solution### Step 4 — Verify EverythingAll files split correctly. MD5 checksums match — zero data loss. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### `split -b 1M` — Byte-Based Splitting in Detail
+
+```
+split -b 1M input.file output_prefix
+
+-b SIZE   = split by BYTES
+  1M      = 1,048,576 bytes exactly (binary MB)
+  1MB     = same (split accepts M and MB)
+  1000000 = 1,000,000 bytes (decimal MB — avoid ambiguity)
+
+How it works:
+  Reads input.file sequentially
+  Writes 1,048,576 bytes to output_prefix + aa
+  Writes next 1,048,576 bytes to output_prefix + ab
+  Writes remainder to output_prefix + ac (may be smaller)
+  Stops when input is exhausted
+
+Original file: NEVER modified (read-only operation)
+```
+
+### The Naming System: `PREFIX` + Auto-Suffix
+
+```
+split -b 1M video.mp4 "video.mp4.part_"
+               ↑             ↑
+           INPUT FILE     OUTPUT PREFIX
+
+PREFIX = everything before the auto-generated suffix
+
+Auto-suffix (default -a 2):
+  aa  → first chunk
+  ab  → second chunk
+  ...
+  az  → 26th chunk
+  ba  → 27th chunk
+  ...
+  zz  → 676th chunk (maximum with 2-char suffix)
+
+Result:
+  video.mp4.part_aa    ← PREFIX "video.mp4.part_" + auto "aa"
+  video.mp4.part_ab    ← PREFIX "video.mp4.part_" + auto "ab"
+  video.mp4.part_ac    ← PREFIX "video.mp4.part_" + auto "ac"
+
+For files needing MORE than 676 chunks (>676 MB):
+  split -b 1M -a 3 video.mp4 "video.mp4.part_"
+  → part_aaa, part_aab ... part_zzz (17,576 chunks = 17.5 GB)
+```
+
+### `dirname` and `basename` — Path Decomposition
+
+```bash
+f="/tmp/app/uploads/video.mp4"
+
+dirname  "$f"  →  /tmp/app/uploads    ← directory component
+basename "$f"  →  video.mp4           ← filename component
+
+# Build the output prefix:
+DIR=$(dirname "$f")                   # /tmp/app/uploads
+BASE=$(basename "$f")                 # video.mp4
+PREFIX="${DIR}/${BASE}.part_"         # /tmp/app/uploads/video.mp4.part_
+
+# Why this matters:
+# split "video.mp4" "video.mp4.part_"  ← creates chunks in CURRENT directory
+# split "video.mp4" "/tmp/app/uploads/video.mp4.part_"  ← creates in SAME dir ✓
+```
+
+### `find -size +1M` — Size Filter
+
+```bash
+find /tmp/app -type f -size +1M
+
++1M  = strictly GREATER THAN 1MB
+-1M  = strictly LESS THAN 1MB
+ 1M  = EXACTLY 1MB (rounded to nearest block)
+
+# Note: find uses 1M = 1,048,576 bytes
+# +1M means > 1,048,576 bytes → splits files that need splitting
+
+# What about exactly 1MB files?
+# -size +1M EXCLUDES exactly 1MB (they're fine as-is)
+# Use -size +1024k if you want > 1024 KB (same threshold)
+
+# Exclude chunks from being re-split:
+find /tmp/app -type f -size +1M ! -name "*.part_*"
+# ! -name "*.part_*" = NOT matching the chunk pattern
+# Prevents splitting chunks of chunks if script runs twice
+```
+
+### MD5 Integrity Verification
+
+```bash
+# Original MD5:
+md5sum video.mp4
+→ a3f5b2e9c7d1... video.mp4
+
+# Reassemble from chunks and compute MD5:
+cat video.mp4.part_* | md5sum
+→ a3f5b2e9c7d1...   ← SAME HASH = identical content ✓
+
+# Why cat video.mp4.part_* works:
+# Shell glob sorts alphabetically: part_aa, part_ab, part_ac
+# cat streams them in order → reconstructs original byte sequence
+# MD5 of stream = MD5 of original = data integrity confirmed
+
+# For binary files (more robust than diff):
+cmp video.mp4 <(cat video.mp4.part_*)
+# cmp exits 0 if identical, non-zero if different
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "Walk me through how you find and split oversized files."
+
+**Answer:**
+```bash
+find /tmp/app -type f -size +1M ! -name "*.part_*" | \
+while IFS= read -r f; do
+    DIR=$(dirname "$f")
+    BASE=$(basename "$f")
+    split -b 1M "$f" "${DIR}/${BASE}.part_"
+done
+```
+
+> *"`find -type f -size +1M` locates regular files strictly over 1 MB. I exclude `*.part_*` so the script is idempotent — running it twice won't re-split existing chunks. For each file, `dirname` and `basename` decompose the path so `split` outputs chunks in the same directory as the original. `split -b 1M` creates exactly 1 MB chunks with alphabetical suffixes. The original is never modified — split only reads it."*
+
+---
+
+### Q2. "How does `split` name the output files? What's the maximum number of chunks?"
+
+**Answer:**
+> *"split appends a generated suffix to whatever prefix you provide. With the default `-a 2`, the suffix cycles through `aa`, `ab`, ..., `az`, `ba`, ..., `zz` — giving 26² = 676 possible chunks. At 1 MB per chunk, that handles files up to 676 MB. For larger files, use `-a 3` to get `aaa`–`zzz` = 17,576 chunks, handling up to ~17.5 GB. For even larger files or human-readable ordering, use `-d` for numeric suffixes: `00`, `01`, `02` — though alphabetic sorts correctly by default, numeric is more intuitive."*
+
+---
+
+### Q3. "How do you verify the chunks are complete and uncorrupted?"
+
+**Answer:**
+> *"Two levels of verification. First, check all chunks are within the size limit:"*
+
+```bash
+find /tmp/app -name "*.part_*" -size +1M
+# Should return nothing — all chunks under 1MB ✓
+```
+
+> *"Second, and more importantly, verify data integrity with MD5 checksum:"*
+
+```bash
+ORIG_MD5=$(md5sum "$f" | awk '{print $1}')
+RECON_MD5=$(cat "${f}.part_"* | md5sum | awk '{print $1}')
+[ "$ORIG_MD5" = "$RECON_MD5" ] && echo "✓ Intact" || echo "✗ Corrupted"
+```
+
+> *"`cat part_*` relies on alphabetical glob ordering — `part_aa` before `part_ab` — which matches the split order, so the reassembled stream is byte-for-byte identical to the original."*
+
+---
+
+### Q4. "What does `! -name '*.part_*'` do in the find command?"
+
+**Answer:**
+> *"The `!` operator negates the following condition. `! -name '*.part_*'` means 'exclude files whose name matches `*.part_*`'. Without this, if you run the script twice, it would try to split the existing chunks — `video.mp4.part_aa` is still over nothing (it's 1MB exactly, so `-size +1M` wouldn't catch it), but a more defensive pattern is still good practice. It also makes the script idempotent: if something fails partway through and you re-run it, existing chunks won't cause confusion. The pattern `*.part_*` uses two wildcards — any name containing `.part_` anywhere."*
+
+---
+
+### Q5. "How would you reassemble the chunks after uploading?"
+
+**Answer:**
+```bash
+# Reassemble a single file:
+cat /tmp/app/uploads/video.mp4.part_* > /tmp/reassembled/video.mp4
+
+# Verify integrity after reassembly:
+md5sum /tmp/app/uploads/video.mp4
+md5sum /tmp/reassembled/video.mp4
+# Both should match ✓
+
+# Reassemble all split files in a directory:
+find /tmp/app -name "*.part_aa" | while IFS= read -r first_chunk; do
+    # Get base name: remove .part_aa to get original name
+    original="${first_chunk%.part_aa}"
+    output_dir=$(dirname "$original")
+    output_name=$(basename "$original")
+
+    echo "Reassembling: $output_name"
+    cat "${original}.part_"* > "/tmp/reassembled/${output_name}"
+done
+```
+
+---
+
+### Q6. "How would you handle files so large they need more than 676 chunks?"
+
+**Answer:**
+> *"Increase the suffix length with `-a N`. Each additional character multiplies capacity by 26:"*
+
+```bash
+split -b 1M -a 3 bigfile.iso "${DIR}/${BASE}.part_"
+# -a 3 = 3-character suffix: aaa → zzz
+# 26³ = 17,576 chunks × 1MB = 17.5 GB maximum
+
+split -b 1M -a 4 hugefile.iso "${DIR}/${BASE}.part_"
+# 26⁴ = 456,976 chunks × 1MB = ~447 GB maximum
+
+# OR use numeric suffix (-d) which scales better:
+split -b 1M -d -a 5 file "${DIR}/${BASE}.part_"
+# 00000 → 99999 = 100,000 chunks × 1MB = ~97 GB
+# Numeric is more human-readable and sorts correctly without special handling
+```
+
+---
+
+### Q7. "What's the difference between `-b 1M` and `-b 1000000`? Which is correct for GoDaddy's 1 MB limit?"
+
+**Answer:**
+> *"1M in split means 1 mebibyte = 1,048,576 bytes (binary). 1000000 means exactly one million bytes (decimal). Cloud storage APIs and most upload limits use decimal MB (1,000,000 bytes). If GoDaddy's limit is 1,000,000 bytes exactly, using `-b 1M` would create chunks of 1,048,576 bytes — slightly over the limit! The safe approach:"*
+
+```bash
+# If limit is 1,000,000 bytes (decimal MB):
+split -b 1000000 "$f" "${DIR}/${BASE}.part_"
+
+# If limit is 1,048,576 bytes (binary MB):
+split -b 1M "$f" "${DIR}/${BASE}.part_"
+
+# To be safe: use slightly under the limit
+split -b 950000 "$f" "${DIR}/${BASE}.part_"
+# 950 KB chunks → always under both decimal and binary 1 MB
+```
+
+---
+
+### Q8. "How would you make this script production-grade with logging and error handling?"
+
+**Answer:**
+```bash
+#!/bin/bash
+# upload_partition.sh — Production-grade file splitter
+
+set -euo pipefail
+
+SOURCE_DIR="${1:-/tmp/app}"
+CHUNK_SIZE="${2:-1M}"
+LOG="/var/log/file_partition.log"
+ERRORS=0
+PROCESSED=0
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+log "Starting partition run: dir=$SOURCE_DIR chunk_size=$CHUNK_SIZE"
+
+find "$SOURCE_DIR" -type f -size +1M ! -name "*.part_*" | \
+while IFS= read -r f; do
+    DIR=$(dirname "$f")
+    BASE=$(basename "$f")
+    PREFIX="${DIR}/${BASE}.part_"
+    ORIG_SIZE=$(du -sh "$f" | cut -f1)
+
+    log "Processing: $f ($ORIG_SIZE)"
+
+    if split -b "$CHUNK_SIZE" "$f" "$PREFIX" 2>>"$LOG"; then
+        CHUNKS=$(ls "${PREFIX}"* 2>/dev/null | wc -l)
+        # Integrity check
+        ORIG_MD5=$(md5sum "$f" | awk '{print $1}')
+        RECON_MD5=$(cat "${PREFIX}"* | md5sum | awk '{print $1}')
+        if [ "$ORIG_MD5" = "$RECON_MD5" ]; then
+            log "  ✓ OK: $CHUNKS chunks, MD5 verified"
+            PROCESSED=$((PROCESSED + 1))
+        else
+            log "  ✗ INTEGRITY FAIL: $f — chunks deleted for safety"
+            rm -f "${PREFIX}"*
+            ERRORS=$((ERRORS + 1))
+        fi
+    else
+        log "  ✗ SPLIT FAILED: $f"
+        ERRORS=$((ERRORS + 1))
+    fi
+done
+
+log "Done. Processed: $PROCESSED | Errors: $ERRORS"
+[ "$ERRORS" -gt 0 ] && exit 1 || exit 0
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+CORE COMMAND:
+  find /tmp/app -type f -size +1M ! -name "*.part_*" | \
+  while IFS= read -r f; do
+      split -b 1M "$f" "$(dirname "$f")/$(basename "$f").part_"
+  done
+
+KEY split FLAGS:
+  -b SIZE   → split by bytes: 1M, 1000000, 512K, 1G
+  -l N      → split by N lines (text files)
+  -a N      → suffix length (default 2 = aa..zz = 676 max)
+  -d        → numeric suffix (00, 01, 02...)
+  -n N      → split into exactly N equal chunks
+
+SUFFIX CAPACITY:
+  -a 2  →    676 chunks (default, up to 676 MB at 1MB/chunk)
+  -a 3  → 17,576 chunks (up to 17.5 GB)
+  -a 4  → 456,976 chunks (up to ~447 GB)
+
+PATH DECOMPOSITION:
+  dirname  "$f"  → /tmp/app/uploads (directory)
+  basename "$f"  → video.mp4 (filename)
+
+IDEMPOTENT FIND (exclude existing chunks):
+  find /tmp/app -type f -size +1M ! -name "*.part_*"
+
+VERIFY CHUNK SIZES:
+  find /tmp/app -name "*.part_*" -size +1M  # should return nothing
+
+MD5 INTEGRITY CHECK:
+  ORIG=$(md5sum "$f" | awk '{print $1}')
+  RECON=$(cat "${f}.part_"* | md5sum | awk '{print $1}')
+  [ "$ORIG" = "$RECON" ] && echo "OK" || echo "FAIL"
+
+REASSEMBLE:
+  cat video.mp4.part_* > video.mp4  # glob sorts aa→ab→ac correctly
+
+DECIMAL vs BINARY:
+  1M  = 1,048,576 bytes (binary mebibyte)
+  1MB = same in split
+  1000000 = 1,000,000 bytes (decimal megabyte)
+  Use 1000000 if API limit is decimal MB to avoid exceeding
+```
+
+> **GoDaddy interview tip:** GoDaddy handles massive file uploads for website assets, domain certificates, and hosting files. They'll ask about **resumability** — if a chunk upload fails at part 3 of 5, can you retry just that chunk? Mention that the part naming (`part_aa`, `part_ab`) makes this trivial — track which parts were ACKed by the server and retry only the failed ones. Also bring up `md5sum` checksums per chunk as API parameters for server-side verification — that's the production pattern their infrastructure team cares about.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Uptime and Load Average Audit
+> **Company:** Microsoft | **Difficulty:** Easy
+---
+#### **Scenario**
+A Linux server is under review for stability and recent performance evaluation.
+#### **Task**
+Use the `uptime` command to determine how long the server has been running and extract the 15-minute load average as a floating-point number (e.g., 0.45). Save the uptime to `/home/devops/uptime.txt` and the 15-minute load average to `/home/devops/loadavg.txt`.
+#### **Example**
+```
+Contents of `/home/devops/uptime.txt`: `2 days, 5:37`
+Contents of `/home/devops/loadavg.txt`: `0.45`
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/uptime-and-load-average-audit)
+
+
+## Uptime and Load Average Audit — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What `uptime` Shows
+
+```bash
+$ uptime
+ 14:35:22 up 2 days, 5:37,  3 users,  load average: 0.12, 0.45, 0.38
+ ├──────┘ ├──────────────┘  ├───────┘  ├───────────────────────────┘
+ │         │                 │           │
+ time now  uptime duration   users       1min, 5min, 15min load averages
+           └── WANT THIS                                   └── WANT THIS
+```
+
+### What Is Load Average?
+
+```
+Load average = number of processes WAITING for CPU or disk at a given moment
+               (averaged over the last 1, 5, or 15 minutes)
+
+Single-core CPU examples:
+  Load = 0.5  → CPU is 50% busy (healthy)
+  Load = 1.0  → CPU is exactly at capacity
+  Load = 2.0  → twice as many tasks as CPU can handle (overloaded)
+
+Multi-core (4 cores):
+  Load = 4.0  → all 4 cores busy (at capacity)
+  Load = 8.0  → overloaded (twice capacity)
+
+Rule of thumb:
+  load / cpu_cores < 1.0  → healthy
+  load / cpu_cores > 1.0  → investigate
+  load / cpu_cores > 2.0  → serious problem
+
+Why 15-minute average for auditing?
+  1-min  → very recent spike, may be temporary
+  5-min  → medium-term trend
+  15-min → sustained load → TRUE picture of server health ✓
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Understand the `uptime` Output Structure### Step 2 — Extract Each Value with Multiple Methods### Step 3 — The Complete SolutionBoth files saved correctly. Now the deep explanation.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### The `uptime` Output — Every Field Mapped
+
+```
+ 14:35:22 up 2 days, 5:37,  3 users,  load average: 0.12, 0.45, 0.38
+ ├──────┘ ├──────────────┘  ├──────┘  ├────────────┘├───┘ ├───┘ ├───┘
+ │         │                 │           │             │     │     │
+ time      how long up       who's on    label        1min  5min  15min
+```
+
+### `/proc/uptime` vs `uptime` Command
+
+```
+cat /proc/uptime
+47.12  26.72
+  ↑       ↑
+  │       └── Total seconds all CPUs spent IDLE since boot
+  └────────── Seconds since system boot (wall clock)
+
+Advantages of /proc/uptime over uptime command:
+  • Machine-readable (no parsing of human text)
+  • Never changes format regardless of OS version
+  • Raw seconds = precise, no ambiguity
+  • Available even in restricted environments
+  • Faster (no process spawn needed with cat)
+
+Convert seconds to human format:
+  SECS=172617   (2 days, 3:56:57)
+  DAYS=$((172617 / 86400))    = 1   ← wait, 172617/86400 = 1.999... = 1 day
+  Actually: 172617 / 86400 = 1 day (int division)
+  Let me recalc: 2*86400 = 172800 > 172617, so it's 1 day
+  HOURS=$(( (172617 % 86400) / 3600 ))  = (172617 - 86400) / 3600 = 86217/3600 = 23
+  MINS=$(( (172617 % 3600) / 60 ))      = (172617 % 3600) / 60 = ...
+
+  Easier: let the OS do it with /proc/uptime integers
+```
+
+### `/proc/loadavg` — The Cleanest Source
+
+```
+cat /proc/loadavg
+0.12  0.45  0.38  2/81  527
+  ↑     ↑     ↑    ↑     ↑
+  │     │     │    │     └── Last PID created
+  │     │     │    └──────── Running processes / Total processes
+  │     │     └───────────── 15-min load average ← FIELD 3
+  │     └─────────────────── 5-min load average
+  └───────────────────────── 1-min load average
+
+Extract 15-min:
+  awk '{print $3}' /proc/loadavg   → 0.38
+  cut -d' ' -f3 /proc/loadavg      → 0.38
+
+Why this beats parsing uptime:
+  No format variations
+  No stripping commas
+  Always field 3, always a decimal number
+```
+
+### Understanding Load Average Numbers
+
+```
+Single CPU system:
+  Load 0.5 = half the time CPU is waiting
+  Load 1.0 = fully utilized (at capacity)
+  Load 2.0 = overloaded — tasks waiting
+
+4-core system:
+  Load 4.0 = fully utilized (normal)
+  Load 8.0 = overloaded
+
+The 15-minute average for auditing:
+  Short spike → 1-min goes up, 15-min barely moves
+  Sustained load → all three averages elevated
+  15-min high + 1-min low = was overloaded, now recovering
+  15-min low + 1-min high = just started spiking
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you extract the 15-minute load average from `uptime`?"
+
+**Answer:**
+> *"Two clean approaches. First and most reliable: read directly from `/proc/loadavg` where field 3 is always the 15-minute average:"*
+
+```bash
+awk '{print $3}' /proc/loadavg
+# → 0.38
+
+# Or from uptime output — $NF (last field) is always 15-min load:
+uptime | awk '{print $NF}'
+# → 0.38
+```
+
+> *"I prefer `/proc/loadavg` for scripts because it never changes format regardless of system locale, timezone, or uptime duration — it's always three space-separated decimal numbers."*
+
+---
+
+### Q2. "What does load average actually measure?"
+
+**Answer:**
+> *"Load average is the average number of processes in a runnable or uninterruptible state over the measured time window. 'Runnable' means actively using CPU or waiting for CPU time. 'Uninterruptible' means waiting for disk I/O or network. A load of 1.0 on a single-core system means the CPU is exactly saturated. On a 4-core system, 4.0 is saturation. The 15-minute average is most useful for auditing because it smooths out short spikes — if 15-minute load is high, the server has been consistently under pressure, not just hit a brief burst."*
+
+---
+
+### Q3. "What's the difference between `uptime` output and `/proc/uptime`?"
+
+**Answer:**
+> *"`uptime` is a human-readable command that formats its output for terminal display — the duration format changes based on how long the system has been running (minutes, hours, days). Parsing it requires regex to handle format variations. `/proc/uptime` is a virtual file from the kernel's proc filesystem containing two raw decimal numbers: seconds since boot and total CPU idle time. It never changes format, is always machine-readable, and is available in any environment. For scripting, `/proc/uptime` is more reliable; for a quick human check, `uptime` is more convenient."*
+
+---
+
+### Q4. "How would you alert if 15-minute load exceeds a threshold?"
+
+**Answer:**
+```bash
+#!/bin/bash
+THRESHOLD=2.0
+CPU_CORES=$(nproc)
+LOAD15=$(awk '{print $3}' /proc/loadavg)
+
+# Compare as floating point using awk
+OVERLOADED=$(awk -v load="$LOAD15" -v cores="$CPU_CORES" -v thresh="$THRESHOLD" \
+    'BEGIN{ if (load/cores > thresh) print "yes"; else print "no" }')
+
+if [ "$OVERLOADED" = "yes" ]; then
+    LOAD_PER_CORE=$(awk -v l="$LOAD15" -v c="$CPU_CORES" 'BEGIN{printf "%.2f", l/c}')
+    echo "ALERT: Load ${LOAD15} on ${CPU_CORES} cores (${LOAD_PER_CORE}x capacity)"
+    # Send to monitoring: logger, slack webhook, PagerDuty, etc.
+fi
+```
+
+---
+
+### Q5. "How does load average differ from CPU percentage?"
+
+**Answer:**
+> *"CPU percentage measures utilization of a single resource — `top` shows `%CPU` as how much of a CPU core a process is using. Load average counts the queue length — how many processes are waiting for work to complete, including disk I/O wait. A server can have low CPU% but high load average if processes are waiting on slow disk or network. Conversely, a server running a CPU-intensive single process might show 100% CPU but load of 1.0. Load average is more holistic — it captures both CPU and I/O bottlenecks, which is why it's the standard metric for server health audits."*
+
+---
+
+### Q6. "How would you convert `/proc/uptime` seconds to a human-readable string?"
+
+**Answer:**
+```bash
+TOTAL_SECS=$(awk '{print int($1)}' /proc/uptime)
+
+DAYS=$(( TOTAL_SECS / 86400 ))
+HOURS=$(( (TOTAL_SECS % 86400) / 3600 ))
+MINS=$(( (TOTAL_SECS % 3600) / 60 ))
+SECS=$(( TOTAL_SECS % 60 ))
+
+if [ $DAYS -gt 0 ]; then
+    echo "${DAYS} days, ${HOURS}:$(printf '%02d' $MINS)"
+elif [ $HOURS -gt 0 ]; then
+    echo "${HOURS}:$(printf '%02d' $MINS)"
+else
+    echo "${MINS} min"
+fi
+
+# Or one-liner with awk:
+awk '{
+    s=int($1); d=s/86400; h=(s%86400)/3600; m=(s%3600)/60
+    if(d>0) printf "%d days, %d:%02d\n",d,h,m
+    else if(h>0) printf "%d:%02d\n",h,m
+    else printf "%d min\n",m
+}' /proc/uptime
+```
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+DATA SOURCES:
+  uptime              → human-readable, format varies
+  /proc/uptime        → raw: "47.12 26.72" (boot_seconds idle_seconds)
+  /proc/loadavg       → raw: "0.12 0.45 0.38 2/81 527"
+
+EXTRACT UPTIME DURATION:
+  # From /proc/uptime (most robust):
+  awk '{s=int($1);d=s/86400;h=(s%86400)/3600;m=(s%3600)/60;
+    if(d>0)printf "%d days, %d:%02d\n",d,h,m;
+    else if(h>0)printf "%d:%02d\n",h,m;
+    else printf "%d min\n",m}' /proc/uptime
+
+  # From uptime command (simpler but format-dependent):
+  uptime | grep -oP '(?<=up )[\d a-z,:]+(?=,\s+\d+ user)'
+
+EXTRACT LOAD AVERAGES:
+  awk '{print $1}' /proc/loadavg   # 1-min
+  awk '{print $2}' /proc/loadavg   # 5-min
+  awk '{print $3}' /proc/loadavg   # 15-min ← audit metric
+  uptime | awk '{print $NF}'       # 15-min from uptime
+
+SAVE TO FILES:
+  awk '{s=int($1);...}' /proc/uptime > /home/devops/uptime.txt
+  awk '{print $3}' /proc/loadavg > /home/devops/loadavg.txt
+
+LOAD INTERPRETATION:
+  load / nproc < 1.0  → healthy
+  load / nproc = 1.0  → at capacity
+  load / nproc > 1.0  → overloaded
+
+LOAD THRESHOLD CHECK (bash can't do floats):
+  awk -v l=$(awk '{print $3}' /proc/loadavg) \
+      -v c=$(nproc) \
+      'BEGIN{if(l/c>1.5) print "OVERLOADED"; else print "OK"}'
+
+PROC FILES:
+  /proc/uptime    → Field 1: seconds since boot
+  /proc/loadavg   → Field 3: 15-min load average
+  /proc/cpuinfo   → processor count (or use nproc)
+```
+
+> **Microsoft interview tip:** Azure Monitor and Windows Admin Center both surface Linux load averages for hybrid server management — mention that in production you'd ship these metrics to Azure Monitor with a custom Log Analytics workspace query, or expose them via `/metrics` for Prometheus scraping. Knowing the threshold formula (`load / CPU cores > 1.0`) and explaining the difference between load average and CPU% shows depth that junior candidates miss. That distinction — I/O wait contributing to load but not CPU% — is exactly the kind of nuance Microsoft's SRE teams deal with on Azure Linux VMs.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Using Unmounted Partitions
+> **Company:** RedHat | **Difficulty:** Medium
+---
+#### **Scenario**
+The server has unmounted partitions that are not being used and could be utilized for additional storage.
+#### **Task**
+Identify unmounted partitions that are safe to use (avoiding system-critical partitions like `/`, `/boot`, `/boot/efi`, or swap), create an ext4 filesystem on one with a label `data_extra`, mount it at `/mnt/test`, and verify it's accessible.
+#### **Example**
+```
+# Before (unmounted partition unused)
+Block devices scanned, unmounted partitions found
+loop0p2: 20GB unmounted, no filesystem
+```
+```
+# After (partition formatted and mounted)
+Filesystem created: ext4 with label=data_extra on /dev/loop0p2
+Mounted at: /mnt/test
+/dev/loop0p2 on /mnt/test type ext4 (rw,relatime)
+Partition ready for use
+```
+---
+📹 [Video Solution](https://prepare.sh/interview/devops/terminal/using-unmounted-partitions)
+
+
+## Using Unmounted Partitions — Full Deep Dive
+
+---
+
+## Part 1: Understand It Simply
+
+### What Is a Partition?
+
+```
+Physical disk (e.g., /dev/sdb — 100GB):
+  ├── /dev/sdb1  (20GB) ← partition 1 — maybe mounted at /home
+  ├── /dev/sdb2  (50GB) ← partition 2 — UNMOUNTED, unused ← our target
+  └── /dev/sdb3  (30GB) ← partition 3 — swap
+
+Block device types in Linux:
+  /dev/sda, /dev/sdb  → SATA/SAS drives
+  /dev/nvme0n1        → NVMe drives
+  /dev/vda, /dev/vdb  → Virtual drives (KVM/QEMU)
+  /dev/xvda           → Xen virtual drives (AWS EC2)
+  /dev/loop0          → Loop devices (files used as block devices)
+```
+
+### The Three-Step Process
+
+```
+Step 1: IDENTIFY
+  lsblk    → see all block devices and mount points
+  blkid    → see which have filesystems already
+  → find one with no filesystem AND not mounted
+
+Step 2: FORMAT
+  mkfs.ext4 -L data_extra /dev/sdb2
+  → writes ext4 filesystem metadata to the partition
+  → labels it "data_extra" for easy identification
+
+Step 3: MOUNT
+  mkdir -p /mnt/test
+  mount /dev/sdb2 /mnt/test
+  → attaches the filesystem to the directory tree
+  → /mnt/test is now the "door" into that partition
+```
+
+---
+
+## Part 2: Build and Execute
+
+### Step 1 — Create a Realistic Unmounted Partition (Loop Device)### Step 2 — The Full Investigation: Find Safe Partitions### Step 3 — Safety Check: Avoid Critical Partitions### Step 4 — Create Filesystem + Mount + VerifyAll steps complete. `/dev/loop0 on /mnt/test type ext4 (rw,relatime)` — exactly matching the expected output.
+
+---
+
+## Part 3: Every Concept Explained Simply
+
+### Block Devices vs Filesystems vs Mount Points
+
+```
+Three separate layers:
+
+LAYER 1: Block Device (hardware level)
+  /dev/sdb2    ← just a raw sequence of bytes on a disk
+  No structure, no files, just sectors
+
+LAYER 2: Filesystem (structure layer)
+  mkfs.ext4 /dev/sdb2   ← writes inode tables, journal, superblock
+  Now the raw bytes have structure: directories, files, metadata
+
+LAYER 3: Mount Point (access layer)
+  mount /dev/sdb2 /mnt/test   ← attaches filesystem to directory tree
+  /mnt/test is now the "door" into that filesystem
+
+Without Step 2: mount fails ("wrong fs type" error)
+Without Step 3: filesystem exists but is inaccessible
+```
+
+### `lsblk` — The Best Tool for Discovery
+
+```bash
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL
+
+NAME     SIZE  TYPE  FSTYPE  MOUNTPOINT  LABEL
+sda      500G  disk
+├─sda1   512M  part  vfat    /boot/efi   EFI
+├─sda2     1G  part  ext4    /boot
+├─sda3   498G  part  ext4    /
+sdb      100G  disk
+├─sdb1    20G  part  ext4    /home       home_data
+└─sdb2    80G  part          ←←← NO FSTYPE, NO MOUNTPOINT = our target
+                               ^^ BLANK = no filesystem yet
+                               ^^ BLANK = not mounted = SAFE TO USE
+```
+
+### `mkfs.ext4` — What It Actually Does
+
+```
+mkfs.ext4 -L data_extra /dev/loop0
+
+mkfs.ext4  = make filesystem, ext4 type
+-L         = assign a LABEL (human-readable name)
+             → findmnt shows it, blkid shows it
+             → can mount by label: mount LABEL=data_extra /mnt/test
+             → useful when /dev/sdX names change across reboots
+
+What mkfs.ext4 writes to the device:
+  Superblock       ← filesystem metadata (size, block count, UUID)
+  Inode table      ← one inode per possible file
+  Block groups     ← where data blocks live
+  Journal          ← ext4 journaling for crash recovery
+  lost+found/      ← recovery directory (created automatically)
+
+After mkfs.ext4:
+  blkid shows: TYPE="ext4" LABEL="data_extra" UUID="..."
+  The UUID never changes even if the device path does ← production gold
+```
+
+### The `mount` Command — What Options Mean
+
+```
+mount /dev/loop0 /mnt/test
+# Uses defaults: rw, relatime, errors=remount-ro
+
+After mounting, mount shows:
+  /dev/loop0 on /mnt/test type ext4 (rw,relatime)
+                                     ↑↑  ↑
+                                     │   └── relatime: atime updated
+                                     │        only when file modified
+                                     └── rw: read-write (not read-only)
+
+Common mount options:
+  ro          → read-only (for snapshots, forensics)
+  noexec      → prevent executing binaries from this filesystem
+  nosuid      → ignore setuid bits (security hardening)
+  noatime     → don't update access times (performance)
+  defaults    → rw,suid,dev,exec,auto,nouser,async
+```
+
+### Making the Mount Permanent — `/etc/fstab`
+
+```
+/etc/fstab = filesystem table — mounts applied at boot time
+
+Without fstab entry:
+  Mount is TEMPORARY — lost after reboot
+
+Add to /etc/fstab:
+  UUID=e6e66c4a-1f9f-400f-8d8c-ed0de1089044  /mnt/test  ext4  defaults  0  2
+
+  Field 1: UUID=...    ← identify by UUID (never by /dev/sdX which can change!)
+  Field 2: /mnt/test   ← where to mount
+  Field 3: ext4        ← filesystem type
+  Field 4: defaults    ← mount options
+  Field 5: 0           ← dump (backup): 0=skip
+  Field 6: 2           ← fsck order: 0=skip, 1=root first, 2=other
+
+Test without rebooting:
+  mount -a    ← mounts everything in /etc/fstab not yet mounted
+```
+
+---
+
+## Part 4: Interview Questions — Detailed Answers
+
+---
+
+### Q1. "How do you find unmounted partitions that are safe to use?"
+
+**Answer:**
+```bash
+# lsblk shows everything at a glance:
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+
+# Unmounted = MOUNTPOINT is empty
+# Safe = not swap, not /, not /boot
+
+# Programmatic approach:
+lsblk -J | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+def check(dev):
+    name = dev.get('name','')
+    mnt = dev.get('mountpoint') or ''
+    fstype = dev.get('fstype') or ''
+    critical = ['/', '/boot', '/boot/efi', '[SWAP]']
+    if not mnt and dev.get('type') in ['part','loop']:
+        print(f'  CANDIDATE: /dev/{name} ({dev[\"size\"]}) fstype={fstype or \"<none>\"}')
+    for child in dev.get('children',[]):
+        check(child)
+for d in data.get('blockdevices',[]): check(d)
+"
+```
+
+> *"I use `lsblk` because it shows the full hierarchy of disks, partitions, and their current mount state in one view. I look for `part` type entries with an empty MOUNTPOINT and no filesystem, cross-checking against `blkid` to confirm no existing data."*
+
+---
+
+### Q2. "What does `mkfs.ext4 -L data_extra` do? Why use a label?"
+
+**Answer:**
+> *"`mkfs.ext4` writes an ext4 filesystem onto the raw block device — it creates the superblock, inode table, block groups, and journal. Without it, the device is just raw bytes with no structure. The `-L data_extra` flag assigns a human-readable label stored in the filesystem's superblock. Labels matter in production because:"*
+
+```bash
+# Block device names (sdX) change between reboots or hardware changes:
+#   Today:  /dev/sdb2 = your data drive
+#   Tomorrow: /dev/sdc2 after adding another disk ← WRONG mount!
+
+# Labels and UUIDs never change:
+mount LABEL=data_extra /mnt/test    ← always finds the right device
+mount UUID=e6e66c4a-...  /mnt/test  ← even more reliable
+
+# In /etc/fstab always use UUID:
+UUID=e6e66c4a-1f9f-400f-8d8c-ed0de1089044  /mnt/test  ext4  defaults  0  2
+```
+
+---
+
+### Q3. "What's the difference between `ext4`, `xfs`, and `btrfs`? When would you use each?"
+
+**Answer:**
+
+| Filesystem | Best For | Key Feature |
+|------------|----------|-------------|
+| `ext4` | General purpose, databases, VMs | Mature, stable, fast recovery |
+| `xfs` | Large files, high throughput, RHEL default | Excellent parallel I/O, online grow |
+| `btrfs` | Snapshots, RAID, deduplication | CoW snapshots, subvolumes |
+| `tmpfs` | RAM-backed temp storage | In-memory, lost on reboot |
+
+> *"For this task, `ext4` is the right choice — it's the most widely supported, works everywhere, and is RedHat's recommended filesystem for general storage. XFS is RHEL's default for the root filesystem, optimized for large files. Btrfs adds snapshot capabilities but has more operational complexity."*
+
+---
+
+### Q4. "How do you make the mount survive a reboot?"
+
+**Answer:**
+```bash
+# Get the UUID (never use /dev/sdX in fstab):
+UUID=$(blkid -o value -s UUID /dev/loop0)
+echo "UUID=$UUID  /mnt/test  ext4  defaults  0  2" >> /etc/fstab
+
+# Test the fstab entry without rebooting:
+mount -a     # mounts all fstab entries not yet mounted
+# OR:
+umount /mnt/test && mount /mnt/test  # unmount and remount from fstab
+
+# Validate fstab syntax before reboot:
+findmnt --verify --fstab
+# A syntax error in fstab can prevent the server from booting!
+```
+
+---
+
+### Q5. "How do you safely confirm a partition has no data before formatting?"
+
+**Answer:**
+```bash
+# Check 1: no filesystem (would be overwritten)
+blkid /dev/sdb2
+# If blank output → no filesystem ✓
+# If shows ext4/xfs/etc → DATA EXISTS — confirm with owner before proceeding
+
+# Check 2: not mounted
+mount | grep "/dev/sdb2"
+grep "/dev/sdb2" /proc/mounts
+# Should return nothing ✓
+
+# Check 3: not swap
+swapon --show | grep "/dev/sdb2"
+# Should return nothing ✓
+
+# Check 4: not in /etc/fstab (already configured for something)
+grep "sdb2\|$(blkid -o value -s UUID /dev/sdb2)" /etc/fstab
+# Should return nothing ✓
+
+# Check 5: hexdump to confirm it's truly empty
+hexdump -C /dev/sdb2 | head -5
+# All zeros = blank ✓
+# Non-zero data = something was written here
+```
+
+---
+
+### Q6. "What is a loop device and why did we use one here?"
+
+**Answer:**
+> *"A loop device makes a regular file act like a block device — it 'loops' file I/O through a virtual device `/dev/loopN`. `losetup -f --show file.img` attaches the file as the next available loop device. This is how Linux mounts ISO images, container layers, disk images, and how `mkfs` and `mount` can work on files. In production you'd use a real partition (`/dev/sdb1`), but loop devices are identical from the kernel's perspective — `mkfs.ext4`, `mount`, and `blkid` work identically on both. They're widely used in containers, cloud init disks, and testing."*
+
+---
+
+## Part 5: Cheat Sheet
+
+```
+DISCOVER UNMOUNTED PARTITIONS:
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL
+  blkid                              # show existing filesystem types
+  lsblk -J                           # JSON output for scripting
+
+SAFETY CHECKS (avoid these):
+  grep "/ \|/boot" /proc/mounts      # critical mounted filesystems
+  swapon --show                      # active swap
+  grep -E "^/|^UUID" /etc/fstab      # fstab entries
+
+FORMAT WITH LABEL:
+  mkfs.ext4 -L data_extra /dev/sdb2  # ext4 with label
+  mkfs.xfs  -L data_extra /dev/sdb2  # xfs with label
+  mkfs.ext4 -n /dev/sdb2             # DRY RUN (no write)
+
+MOUNT:
+  mkdir -p /mnt/test
+  mount /dev/sdb2 /mnt/test
+  mount LABEL=data_extra /mnt/test   # by label
+  mount UUID=xxxx /mnt/test          # by UUID (most reliable)
+
+VERIFY:
+  mount | grep /mnt/test
+  findmnt /mnt/test
+  df -h /mnt/test
+  lsblk -o NAME,FSTYPE,LABEL,MOUNTPOINT
+
+MAKE PERMANENT (/etc/fstab):
+  UUID=$(blkid -o value -s UUID /dev/sdb2)
+  echo "UUID=$UUID /mnt/test ext4 defaults 0 2" >> /etc/fstab
+  mount -a        # apply without reboot
+  findmnt --verify --fstab  # validate syntax
+
+UNMOUNT SAFELY:
+  umount /mnt/test
+  umount /dev/sdb2  # same result, by device
+
+LOOP DEVICE (for testing):
+  dd if=/dev/zero of=/tmp/disk.img bs=1M count=200
+  losetup -f --show /tmp/disk.img    # attach → /dev/loop0
+  losetup -d /dev/loop0              # detach when done
+```
+
+> **RedHat interview tip:** RHEL is the enterprise Linux standard — they'll push you on persistence (`/etc/fstab` with UUID), filesystem choice (why ext4 vs xfs for different workloads), and disaster recovery (`e2fsck /dev/sdb2` to check and repair ext4). Mention `tune2fs -l /dev/sdb2` to inspect filesystem metadata without mounting, and `resize2fs` for online partition expansion — that's the operational depth RHEL Certified Engineers are expected to have.
